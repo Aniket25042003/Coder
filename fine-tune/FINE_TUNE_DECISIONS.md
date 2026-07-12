@@ -99,7 +99,7 @@ Add only if Phase 1 val/smoke shows weak domain lift or Phase 2 needs raw materi
 ### Choice
 - **Method:** **LoRA** continued pretrain on `Qwen3.5-4B-Base` (primary). **Not** full FT for v1 Phase 1.
 - **Stack class:** **Unsloth-class** (or equivalent fused/fast LoRA trainer) + BF16 + FlashAttention where available; minimize padding waste via packing.
-- **Seq length:** **2048–4096** (default start **4096**; drop to **2048** if needed for tok/s or VRAM).
+- **Seq length:** **2048–4096** (Colab A100 40GB default **2048** + large batch for tok/s; trial **4096** only if measured tok/s wins).
 - **Token target:** **~5B tokens** stretch on Colab; accept **~2–3B** if measured throughput can’t hit 5B.
 - **Data:** stream/sample from full `coder-pretrain-60gb` train split (shuffle + seed); no need to materialize a separate 5B-token export first.
 - **QLoRA:** only if BF16 LoRA OOMs on the assigned GPU; prefer BF16 LoRA on A100 40GB.
@@ -120,9 +120,17 @@ Full FT for ~15–25B tokens needs weeks on one A100 and far more than ~300 Cola
 | Packing | **On** — concat docs to `max_seq_len` with EOS; minimize pad |
 | FIM | **Off by default** for speed; optional later ≤20% on code |
 
+### Colab A100 40GB throughput defaults (Phase 1 script / notebook)
+| Knob | Value | Notes |
+| --- | --- | --- |
+| `max_seq_len` | **2048** | Prefer over 4096 when maximizing tokens/credit |
+| `per_device_train_batch_size` | **16** (try **24–32**) | Smoke used 2 → ~18GB; fill toward **35–38GB** peak |
+| `gradient_accumulation_steps` | **1** | Prefer real batch over fake accum for throughput |
+| Logs | every **5** steps + **EARLY_PROJECTION** (~10 min) | Scale batch/seq from `tok/s` + `peak` VRAM |
+
 ### Throughput / success criteria
-- First-hour goal: push toward **~25–35k tok/s** sustained if possible (needed to approach 5B in ~40–50 useful hours).
-- If first-hour tok/s projects under 5B over remaining credits → shorten seq to 2K, raise batch, or lock a **2–3B** target and stop cleanly.
+- Early (~10 min) and first-hour goal: push toward **~25–35k tok/s** sustained if possible (needed to approach 5B in ~40–50 useful hours).
+- If projection under 5B over remaining credits → raise batch (while peak VRAM < ~38GB), keep seq 2048, or lock a **2–3B** target and stop cleanly.
 
 ### Phase 2 / 1.5 (intent only — details TBD)
 - **Phase 2:** instruction / PR SFT — continue with **LoRA** (merge or stack adapters as needed).
