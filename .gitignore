@@ -1,0 +1,34 @@
+# Secrets / local env
+.env
+.env.*
+!.env.example
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+.venv/
+venv/
+env/
+
+# Checkpoints / data / logs
+ckpts/
+checkpoints/
+*.pt
+*.bin
+*.safetensors
+runs/
+tb/
+wandb/
+scratch/
+data/
+final/
+*.parquet
+
+# Jupyter / IDE
+.ipynb_checkpoints/
+.idea/
+.vscode/
+.DS_Store

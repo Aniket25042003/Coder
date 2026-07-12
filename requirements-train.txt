@@ -1,0 +1,18 @@
+# Phase A pretrain stack (CUDA 12.x + Ampere/Hopper GPUs)
+# Install PyTorch first for your platform, e.g.:
+#   pip install torch==2.6.0 --index-url https://download.pytorch.org/whl/cu124
+#
+# flash-attn is optional but recommended; install a wheel matching your
+# torch/CUDA (building from source needs ninja + matching CUDA toolkit):
+#   pip install flash-attn>=2.7.3 --no-build-isolation
+
+torch>=2.5.0,<2.8
+transformers>=4.46.0
+datasets>=3.0.0
+huggingface_hub>=0.26.0
+safetensors>=0.4.5
+numpy>=1.26.0
+tqdm>=4.66.0
+tensorboard>=2.17.0
+# optional logging
+wandb>=0.18.0; python_version>="3.10"
