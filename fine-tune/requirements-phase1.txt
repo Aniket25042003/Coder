@@ -4,8 +4,10 @@
 #   pip install -r requirements-phase1.txt
 #   # or Unsloth's recommended Colab install snippet, then:
 #   pip install "transformers>=5.0.0" datasets trl peft accelerate huggingface_hub
+#   pip install "flash-linear-attention[cuda]" causal-conv1d
 #
-# Qwen3.5 requires transformers v5. Do NOT use QLoRA for Qwen3.5 (quality/VRAM).
+# Qwen3.5 requires transformers v5 + FLA stack for fast linear-attention.
+# Do NOT use QLoRA for Qwen3.5 (quality/VRAM).
 
 torch>=2.5.0
 transformers>=5.0.0
@@ -18,6 +20,9 @@ safetensors>=0.4.5
 sentencepiece>=0.2.0
 protobuf>=4.25.0
 tqdm>=4.66.0
+# Qwen3.5 hybrid attention fast path (required for usable Colab tok/s)
+flash-linear-attention[cuda]>=0.2.0
+causal-conv1d>=1.4.0
 # Install Unsloth for your platform, e.g.:
 #   pip install "unsloth[colab-new] @ git+https://github.com/unslothai/unsloth.git"
 # or follow https://unsloth.ai/docs/get-started/install

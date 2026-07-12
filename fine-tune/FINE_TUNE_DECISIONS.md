@@ -124,13 +124,16 @@ Full FT for ~15–25B tokens needs weeks on one A100 and far more than ~300 Cola
 | Knob | Value | Notes |
 | --- | --- | --- |
 | `max_seq_len` | **2048** | Prefer over 4096 when maximizing tokens/credit |
-| `per_device_train_batch_size` | **16** (try **24–32**) | Smoke used 2 → ~18GB; fill toward **35–38GB** peak |
+| `per_device_train_batch_size` | **40** (try **48+**) | Fill toward **35–38GB** peak on 40GB A100 |
 | `gradient_accumulation_steps` | **1** | Prefer real batch over fake accum for throughput |
+| FLA stack | **`flash-linear-attention` + `causal-conv1d`** | Required; otherwise torch fallback ≈ few k tok/s |
+| Packing | **On** via text tokenizer (not multimodal processor) | Confirm log: `Sample packing is ACTIVE` |
 | Logs | every **5** steps + **EARLY_PROJECTION** (~10 min) | Scale batch/seq from `tok/s` + `peak` VRAM |
 
 ### Throughput / success criteria
 - Early (~10 min) and first-hour goal: push toward **~25–35k tok/s** sustained if possible (needed to approach 5B in ~40–50 useful hours).
 - If projection under 5B over remaining credits → raise batch (while peak VRAM < ~38GB), keep seq 2048, or lock a **2–3B** target and stop cleanly.
+- Prefer **A100 40GB** over 80GB unless 40GB OOMs after FLA+packing+high batch (80GB costs ~+23% credits; only worth it if tok/s rises more than that).
 
 ### Phase 2 / 1.5 (intent only — details TBD)
 - **Phase 2:** instruction / PR SFT — continue with **LoRA** (merge or stack adapters as needed).

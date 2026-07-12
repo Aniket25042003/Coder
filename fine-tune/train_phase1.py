@@ -18,15 +18,19 @@ Smoke test (~10 min on Colab A100):
 Full Phase 1 (multi-session; resume after each ~12h Colab kill):
   PYTHONUNBUFFERED=1 python -u train_phase1.py \\
       --token_budget 5000000000 --max_seq_len 2048 \\
-      --per_device_train_batch_size 16 --gradient_accumulation_steps 1 \\
+      --per_device_train_batch_size 40 --gradient_accumulation_steps 1 \\
       --output_dir ./ckpts/phase1-lora \\
       --hub_model_id YOUR_USER/coder-qwen35-4b-phase1-lora \\
       --resume auto --ckpt_minutes 30 --logging_steps 5
 
+Requires FLA stack for Qwen3.5 speed (Colab install cell):
+  pip install "flash-linear-attention[cuda]" causal-conv1d
+
 First ~10–15 min: watch tok/s + VRAM (GB). Aim ~35–38 GB used.
-  - If VRAM < 30 GB → raise --per_device_train_batch_size (24, then 32)
-  - If OOM → lower batch (12 → 8) or keep seq 2048
-  - Optional: trial --max_seq_len 4096 --per_device_train_batch_size 8; keep whichever tok/s wins
+  - Confirm logs do NOT say "Sample packing skipped" or "fast path is not available"
+  - If VRAM < 30 GB → raise --per_device_train_batch_size (48+)
+  - If OOM → lower batch (32 → 24) or keep seq 2048
+  - Optional: trial --max_seq_len 4096 with smaller batch; keep whichever tok/s wins
 """
 
 from __future__ import annotations
@@ -68,7 +72,7 @@ class Phase1Config:
     token_budget: int = 5_000_000_000
     max_steps: Optional[int] = None  # override; else derived from budget
 
-    per_device_train_batch_size: int = 16
+    per_device_train_batch_size: int = 40
     gradient_accumulation_steps: int = 1
     learning_rate: float = 1e-4
     warmup_steps: int = 100
@@ -86,6 +90,7 @@ class Phase1Config:
     smoke_every_saves: int = 4
     push_to_hub: bool = True
     project_after_minutes: float = 10.0  # early projection for batch/seq tuning
+    packing: bool = True
 
 
 # =============================================================================
@@ -261,8 +266,9 @@ class TokenBudgetCallback(TrainerCallback):
         )
         if proj < 0.6 * self.cfg.token_budget:
             LOG.warning(
-                "Projection < 60%% of token_budget. Raise --per_device_train_batch_size "
-                "(try 24/32) before burning more credits; keep --max_seq_len 2048 unless 4096 is faster."
+                "Projection < 60%% of token_budget. Confirm FLA fast path + packing ACTIVE; "
+                "then raise --per_device_train_batch_size (try 48+) before burning more credits; "
+                "keep --max_seq_len 2048 unless 4096 is faster."
             )
 
     def on_step_end(
@@ -442,6 +448,95 @@ def load_val_dataset(cfg: Phase1Config):
 # =============================================================================
 
 
+def check_fla_fast_path() -> None:
+    """Qwen3.5 hybrid layers need flash-linear-attention + causal-conv1d."""
+    fla_ok = False
+    conv_ok = False
+    try:
+        import fla  # noqa: F401
+
+        fla_ok = True
+    except ImportError:
+        try:
+            import flash_linear_attention  # noqa: F401
+
+            fla_ok = True
+        except ImportError:
+            LOG.warning(
+                "flash-linear-attention not installed — Qwen3.5 will use slow torch "
+                "linear-attention. Install: pip install 'flash-linear-attention[cuda]'"
+            )
+    try:
+        import causal_conv1d  # noqa: F401
+
+        conv_ok = True
+    except ImportError:
+        LOG.warning(
+            "causal-conv1d not installed — Qwen3.5 fast path disabled. "
+            "Install: pip install causal-conv1d"
+        )
+
+    try:
+        from transformers.utils import import_utils as iu
+
+        for name in (
+            "is_flash_linear_attention_available",
+            "is_flash_linear_attn_available",
+            "is_causal_conv1d_available",
+        ):
+            fn = getattr(iu, name, None)
+            if callable(fn):
+                try:
+                    LOG.info("%s -> %s", name, fn())
+                except Exception as e:  # noqa: BLE001
+                    LOG.info("%s check failed: %s", name, e)
+    except Exception:  # noqa: BLE001
+        pass
+
+    if fla_ok and conv_ok:
+        LOG.info("FLA stack imports OK (flash-linear-attention + causal-conv1d)")
+    else:
+        LOG.warning(
+            "FLA stack incomplete (fla=%s causal_conv1d=%s). Expect low tok/s until fixed.",
+            fla_ok,
+            conv_ok,
+        )
+
+
+def _as_text_tokenizer(tokenizer_or_processor: Any) -> Any:
+    """Prefer plain text tokenizer so Unsloth/TRL enable packing (not ProcessorMixin)."""
+    tok = getattr(tokenizer_or_processor, "tokenizer", None)
+    if tok is not None:
+        LOG.info(
+            "Text-only CPT: extracted .tokenizer from %s (enables sample packing)",
+            type(tokenizer_or_processor).__name__,
+        )
+        return tok
+    return tokenizer_or_processor
+
+
+def _prepare_text_tokenizer(tokenizer: Any) -> Any:
+    # Causal LM + packing: right pad; avoid vision pad token for text CPT
+    if hasattr(tokenizer, "padding_side"):
+        tokenizer.padding_side = "right"
+    eos = getattr(tokenizer, "eos_token", None)
+    if eos is not None:
+        tokenizer.pad_token = eos
+    elif getattr(tokenizer, "pad_token", None) is None:
+        tokenizer.pad_token = tokenizer.eos_token
+    return tokenizer
+
+
+def _disable_vision_finetune_kwargs() -> Dict[str, Any]:
+    """Best-effort: skip vision adapters on multimodal Qwen3.5 checkpoints."""
+    return {
+        "finetune_vision_layers": False,
+        "finetune_language_layers": True,
+        "finetune_attention_modules": True,
+        "finetune_mlp_modules": True,
+    }
+
+
 def load_model_and_tokenizer(cfg: Phase1Config):
     try:
         from unsloth import FastLanguageModel
@@ -451,10 +546,12 @@ def load_model_and_tokenizer(cfg: Phase1Config):
             "or see requirements-phase1.txt / phase1_colab.ipynb"
         ) from e
 
+    check_fla_fast_path()
+
     model_name = cfg.model_name
-    LOG.info("Loading %s (BF16 LoRA, seq=%s)", model_name, cfg.max_seq_len)
+    LOG.info("Loading %s (BF16 LoRA, seq=%s, text-only packing path)", model_name, cfg.max_seq_len)
     try:
-        model, tokenizer = FastLanguageModel.from_pretrained(
+        model, tokenizer_or_proc = FastLanguageModel.from_pretrained(
             model_name=model_name,
             max_seq_length=cfg.max_seq_len,
             load_in_4bit=False,
@@ -465,7 +562,7 @@ def load_model_and_tokenizer(cfg: Phase1Config):
         if model_name.startswith("unsloth/"):
             alt = "Qwen/Qwen3.5-4B-Base"
             LOG.warning("Failed loading %s (%s); falling back to %s", model_name, e, alt)
-            model, tokenizer = FastLanguageModel.from_pretrained(
+            model, tokenizer_or_proc = FastLanguageModel.from_pretrained(
                 model_name=alt,
                 max_seq_length=cfg.max_seq_len,
                 load_in_4bit=False,
@@ -476,11 +573,9 @@ def load_model_and_tokenizer(cfg: Phase1Config):
         else:
             raise
 
-    if tokenizer.pad_token is None:
-        tokenizer.pad_token = tokenizer.eos_token
+    tokenizer = _prepare_text_tokenizer(_as_text_tokenizer(tokenizer_or_proc))
 
-    model = FastLanguageModel.get_peft_model(
-        model,
+    peft_kwargs: Dict[str, Any] = dict(
         r=cfg.lora_r,
         target_modules=[
             "q_proj",
@@ -498,6 +593,15 @@ def load_model_and_tokenizer(cfg: Phase1Config):
         random_state=cfg.seed,
         max_seq_length=cfg.max_seq_len,
     )
+    peft_kwargs.update(_disable_vision_finetune_kwargs())
+
+    try:
+        model = FastLanguageModel.get_peft_model(model, **peft_kwargs)
+    except TypeError:
+        for k in _disable_vision_finetune_kwargs():
+            peft_kwargs.pop(k, None)
+        model = FastLanguageModel.get_peft_model(model, **peft_kwargs)
+
     return model, tokenizer
 
 
@@ -550,7 +654,7 @@ def build_trainer(cfg: Phase1Config, model, tokenizer, train_ds, val_ds, phase_s
         remove_unused_columns=False,
         dataloader_num_workers=2,
         max_seq_length=cfg.max_seq_len,
-        packing=True,
+        packing=cfg.packing,
         dataset_text_field="text",
     )
     # Hub push (adapters)
@@ -572,6 +676,19 @@ def build_trainer(cfg: Phase1Config, model, tokenizer, train_ds, val_ds, phase_s
 
     callbacks = [TokenBudgetCallback(cfg, phase_state)]
 
+    # Must be a Tokenizer, not ProcessorMixin — Unsloth skips packing for processors
+    proc_name = type(tokenizer).__name__
+    if "Processor" in proc_name:
+        LOG.error(
+            "processing_class is %s (processor). Packing will be skipped. "
+            "Text-only extraction failed — aborting.",
+            proc_name,
+        )
+        raise SystemExit(
+            "Need a text tokenizer for packing. Got processor: " + proc_name
+        )
+    LOG.info("SFTTrainer processing_class=%s packing=%s", proc_name, cfg.packing)
+
     trainer_kwargs: Dict[str, Any] = dict(
         model=model,
         args=args,
@@ -590,12 +707,14 @@ def build_trainer(cfg: Phase1Config, model, tokenizer, train_ds, val_ds, phase_s
         # packing via dataset map fallback handled by TRL defaults
         trainer = SFTTrainer(**trainer_kwargs)
 
-    # Ensure packing flags when using older signature
-    if hasattr(trainer, "args") and not getattr(trainer.args, "packing", False):
+    packing_on = bool(getattr(trainer.args, "packing", False))
+    if cfg.packing and not packing_on:
         LOG.warning(
-            "SFTTrainer packing flag may be inactive on this TRL version; "
-            "upgrade trl if pad waste is high."
+            "Requested packing=True but trainer.args.packing is False "
+            "(Unsloth/TRL may have disabled it). Expect pad waste / lower tok/s."
         )
+    elif packing_on:
+        LOG.info("Sample packing is ACTIVE")
     return trainer
 
 
@@ -693,7 +812,7 @@ def parse_args(argv: Optional[List[str]] = None) -> Phase1Config:
     p.add_argument("--max_seq_len", type=int, default=2048, choices=[2048, 4096, 1024, 8192])
     p.add_argument("--token_budget", type=int, default=5_000_000_000)
     p.add_argument("--max_steps", type=int, default=None)
-    p.add_argument("--per_device_train_batch_size", type=int, default=16)
+    p.add_argument("--per_device_train_batch_size", type=int, default=40)
     p.add_argument("--gradient_accumulation_steps", type=int, default=1)
     p.add_argument("--learning_rate", type=float, default=1e-4)
     p.add_argument("--warmup_steps", type=int, default=100)
@@ -705,6 +824,7 @@ def parse_args(argv: Optional[List[str]] = None) -> Phase1Config:
     p.add_argument("--lora_alpha", type=int, default=128)
     p.add_argument("--remaining_colab_hours", type=float, default=45.0)
     p.add_argument("--project_after_minutes", type=float, default=10.0)
+    p.add_argument("--no_packing", action="store_true", help="Disable sample packing")
     p.add_argument("--no_push_to_hub", action="store_true")
     args = p.parse_args(argv)
 
@@ -731,6 +851,7 @@ def parse_args(argv: Optional[List[str]] = None) -> Phase1Config:
         lora_alpha=args.lora_alpha,
         remaining_colab_hours=args.remaining_colab_hours,
         project_after_minutes=args.project_after_minutes,
+        packing=not args.no_packing,
         push_to_hub=not args.no_push_to_hub,
     )
 
