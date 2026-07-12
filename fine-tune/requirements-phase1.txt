@@ -1,0 +1,24 @@
+# Phase 1 LoRA CPT (Colab A100 40GB / Unsloth)
+# Install order matters on Colab — see phase1_colab.ipynb.
+#
+#   pip install -r requirements-phase1.txt
+#   # or Unsloth's recommended Colab install snippet, then:
+#   pip install "transformers>=5.0.0" datasets trl peft accelerate huggingface_hub
+#
+# Qwen3.5 requires transformers v5. Do NOT use QLoRA for Qwen3.5 (quality/VRAM).
+
+torch>=2.5.0
+transformers>=5.0.0
+datasets>=3.0.0
+trl>=0.14.0
+peft>=0.14.0
+accelerate>=1.0.0
+huggingface_hub>=0.26.0
+safetensors>=0.4.5
+sentencepiece>=0.2.0
+protobuf>=4.25.0
+tqdm>=4.66.0
+# Install Unsloth for your platform, e.g.:
+#   pip install "unsloth[colab-new] @ git+https://github.com/unslothai/unsloth.git"
+# or follow https://unsloth.ai/docs/get-started/install
+unsloth>=2025.1.0
