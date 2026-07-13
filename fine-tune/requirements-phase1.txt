@@ -22,7 +22,9 @@ protobuf>=4.25.0
 tqdm>=4.66.0
 # Qwen3.5 hybrid attention fast path (required for usable Colab tok/s)
 flash-linear-attention[cuda]>=0.2.0
-causal-conv1d>=1.4.0
+# Do NOT bare `pip install causal-conv1d` on Colab torch 2.11 — no wheel, source build fails.
+# Use fine-tune/install_fla_stack.py or the notebook wheel-first installer (Dao-AILab cu12torch2.10).
+# causal-conv1d>=1.4.0
 # Install Unsloth for your platform, e.g.:
 #   pip install "unsloth[colab-new] @ git+https://github.com/unslothai/unsloth.git"
 # or follow https://unsloth.ai/docs/get-started/install
