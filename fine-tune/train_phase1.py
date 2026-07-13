@@ -18,18 +18,18 @@ Smoke test (~10 min on Colab A100):
 Full Phase 1 (multi-session; resume after each ~12h Colab kill):
   PYTHONUNBUFFERED=1 python -u train_phase1.py \\
       --token_budget 5000000000 --max_seq_len 2048 \\
-      --per_device_train_batch_size 40 --gradient_accumulation_steps 1 \\
+      --per_device_train_batch_size 48 --gradient_accumulation_steps 1 \\
       --output_dir ./ckpts/phase1-lora \\
       --hub_model_id YOUR_USER/coder-qwen35-4b-phase1-lora \\
       --resume auto --ckpt_minutes 30 --logging_steps 5
 
-Requires FLA stack for Qwen3.5 speed (Colab install cell):
-  pip install "flash-linear-attention[cuda]" causal-conv1d
+Requires FLA stack for Qwen3.5 speed (Colab install cell / install_fla_stack.py):
+  flash-linear-attention + causal-conv1d (Dao-AILab wheel on torch 2.11)
 
 First ~10–15 min: watch tok/s + VRAM (GB). Aim ~35–38 GB used.
-  - Confirm logs do NOT say "Sample packing skipped" or "fast path is not available"
-  - If VRAM < 30 GB → raise --per_device_train_batch_size (48+)
-  - If OOM → lower batch (32 → 24) or keep seq 2048
+  - Confirm: Sample packing is ACTIVE; no "fast path is not available"
+  - If VRAM < 30 GB → raise --per_device_train_batch_size (56+)
+  - If OOM → lower batch (40 → 32) or keep seq 2048
   - Optional: trial --max_seq_len 4096 with smaller batch; keep whichever tok/s wins
 """
 
@@ -46,6 +46,17 @@ import traceback
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional
+
+# CRITICAL: Unsloth must import before transformers / peft so its patches apply.
+# (Otherwise: "Unsloth should be imported before [transformers, peft]" + slower path.)
+try:
+    import unsloth  # noqa: F401
+    from unsloth import FastLanguageModel
+except ImportError as e:
+    raise SystemExit(
+        "Unsloth is required. Install per https://unsloth.ai/docs/get-started/install "
+        "or see requirements-phase1.txt / phase1_colab.ipynb"
+    ) from e
 
 import torch
 from transformers import TrainerCallback, TrainerControl, TrainerState, TrainingArguments
@@ -72,7 +83,7 @@ class Phase1Config:
     token_budget: int = 5_000_000_000
     max_steps: Optional[int] = None  # override; else derived from budget
 
-    per_device_train_batch_size: int = 40
+    per_device_train_batch_size: int = 48
     gradient_accumulation_steps: int = 1
     learning_rate: float = 1e-4
     warmup_steps: int = 100
@@ -91,6 +102,7 @@ class Phase1Config:
     push_to_hub: bool = True
     project_after_minutes: float = 10.0  # early projection for batch/seq tuning
     packing: bool = True
+    strip_vision: bool = True  # required for Unsloth packing on Qwen3.5
 
 
 # =============================================================================
@@ -508,7 +520,7 @@ def _as_text_tokenizer(tokenizer_or_processor: Any) -> Any:
     tok = getattr(tokenizer_or_processor, "tokenizer", None)
     if tok is not None:
         LOG.info(
-            "Text-only CPT: extracted .tokenizer from %s (enables sample packing)",
+            "Text-only CPT: extracted .tokenizer from %s",
             type(tokenizer_or_processor).__name__,
         )
         return tok
@@ -537,16 +549,114 @@ def _disable_vision_finetune_kwargs() -> Dict[str, Any]:
     }
 
 
-def load_model_and_tokenizer(cfg: Phase1Config):
+def _safe_delattr(obj: Any, name: str) -> bool:
+    if obj is None or not hasattr(obj, name):
+        return False
     try:
-        from unsloth import FastLanguageModel
-    except ImportError as e:
-        raise SystemExit(
-            "Unsloth is required. Install per https://unsloth.ai/docs/get-started/install "
-            "or see requirements-phase1.txt / phase1_colab.ipynb"
-        ) from e
+        delattr(obj, name)
+        return True
+    except Exception:
+        try:
+            setattr(obj, name, None)
+            return True
+        except Exception:
+            return False
 
+
+def _strip_vision_for_text_cpt(model: Any) -> Any:
+    """Remove VLM bits so Unsloth treats this as a text LM and allows packing.
+
+    Community pattern for Qwen3.5 text-only CPT (see unsloth#4120).
+    """
+    removed: List[str] = []
+
+    # Nested / flat visual modules seen across Qwen VL / 3.5 releases
+    for parent_path, attr in (
+        (("model",), "visual"),
+        (("model",), "vision_tower"),
+        (("model",), "multi_modal_projector"),
+        (("model", "model"), "visual"),
+        (("model", "model"), "vision_tower"),
+        (("model", "model"), "multi_modal_projector"),
+        ((), "visual"),
+        ((), "vision_tower"),
+        ((), "multi_modal_projector"),
+    ):
+        obj: Any = model
+        ok = True
+        for p in parent_path:
+            obj = getattr(obj, p, None)
+            if obj is None:
+                ok = False
+                break
+        if not ok:
+            continue
+        if _safe_delattr(obj, attr):
+            removed.append(".".join(list(parent_path) + [attr]) if parent_path else attr)
+
+    cfg = getattr(model, "config", None)
+    if cfg is not None:
+        for attr in (
+            "vision_config",
+            "image_token_id",
+            "video_token_id",
+            "vision_start_token_id",
+            "vision_end_token_id",
+        ):
+            if _safe_delattr(cfg, attr):
+                removed.append(f"config.{attr}")
+        # Spoof architecture name so Unsloth's VLM detectors do not re-enable the skip.
+        # Keep a text-ish CausalLM style label (typo-safe substring matching avoidance).
+        try:
+            cfg.architectures = ["Qwen3_5ForCausalLM"]
+            removed.append("config.architectures->Qwen3_5ForCausalLM")
+        except Exception:
+            pass
+
+    if removed:
+        LOG.info("Stripped vision for text CPT: %s", ", ".join(removed))
+    else:
+        LOG.warning(
+            "strip_vision=True but no vision modules/config found — "
+            "packing may still be skipped if Unsloth classifies the model as VLM."
+        )
+    return model
+
+
+def _patch_unsloth_allow_packing() -> None:
+    """Best-effort: neutralize Unsloth's VLM packing skip after text-only strip."""
+    try:
+        import unsloth.trainer as ut
+    except Exception as e:  # noqa: BLE001
+        LOG.debug("unsloth.trainer not patchable: %s", e)
+        return
+
+    # Newer Unsloth builds wire packing skips inside auto-packing helpers.
+    for name in (
+        "is_vision_model",
+        "is_vlm",
+        "_is_vlm",
+        "check_vision_model",
+    ):
+        if hasattr(ut, name) and callable(getattr(ut, name)):
+            setattr(ut, name, lambda *a, **k: False)
+            LOG.info("Patched unsloth.trainer.%s -> False (allow packing)", name)
+
+    # Also try unsloth_zoo helpers if present
+    for mod_name in ("unsloth_zoo.vision_utils", "unsloth_zoo.training_utils"):
+        try:
+            mod = __import__(mod_name, fromlist=["*"])
+        except Exception:
+            continue
+        for name in ("is_vision_model", "is_vlm", "_is_vlm"):
+            if hasattr(mod, name) and callable(getattr(mod, name)):
+                setattr(mod, name, lambda *a, **k: False)
+                LOG.info("Patched %s.%s -> False (allow packing)", mod_name, name)
+
+
+def load_model_and_tokenizer(cfg: Phase1Config):
     check_fla_fast_path()
+    _patch_unsloth_allow_packing()
 
     model_name = cfg.model_name
     LOG.info("Loading %s (BF16 LoRA, seq=%s, text-only packing path)", model_name, cfg.max_seq_len)
@@ -575,6 +685,9 @@ def load_model_and_tokenizer(cfg: Phase1Config):
 
     tokenizer = _prepare_text_tokenizer(_as_text_tokenizer(tokenizer_or_proc))
 
+    if cfg.strip_vision:
+        model = _strip_vision_for_text_cpt(model)
+
     peft_kwargs: Dict[str, Any] = dict(
         r=cfg.lora_r,
         target_modules=[
@@ -601,6 +714,17 @@ def load_model_and_tokenizer(cfg: Phase1Config):
         for k in _disable_vision_finetune_kwargs():
             peft_kwargs.pop(k, None)
         model = FastLanguageModel.get_peft_model(model, **peft_kwargs)
+
+    # Re-assert text-only markers after PEFT wrap (wrappers sometimes re-expose config)
+    if cfg.strip_vision:
+        root = getattr(model, "base_model", model)
+        root = getattr(root, "model", root)
+        base = getattr(model, "get_base_model", lambda: model)()
+        for m in (model, root, base):
+            try:
+                _strip_vision_for_text_cpt(m)
+            except Exception:  # noqa: BLE001
+                pass
 
     return model, tokenizer
 
@@ -709,11 +833,12 @@ def build_trainer(cfg: Phase1Config, model, tokenizer, train_ds, val_ds, phase_s
 
     packing_on = bool(getattr(trainer.args, "packing", False))
     if cfg.packing and not packing_on:
-        LOG.warning(
-            "Requested packing=True but trainer.args.packing is False "
-            "(Unsloth/TRL may have disabled it). Expect pad waste / lower tok/s."
+        raise SystemExit(
+            "FATAL: packing requested but trainer.args.packing is False after SFTTrainer init. "
+            "Unsloth likely still treats the model as VLM (vision strip failed). "
+            "Do not burn credits — fix strip_vision / Unsloth version, or pass --no_packing."
         )
-    elif packing_on:
+    if packing_on:
         LOG.info("Sample packing is ACTIVE")
     return trainer
 
@@ -812,7 +937,7 @@ def parse_args(argv: Optional[List[str]] = None) -> Phase1Config:
     p.add_argument("--max_seq_len", type=int, default=2048, choices=[2048, 4096, 1024, 8192])
     p.add_argument("--token_budget", type=int, default=5_000_000_000)
     p.add_argument("--max_steps", type=int, default=None)
-    p.add_argument("--per_device_train_batch_size", type=int, default=40)
+    p.add_argument("--per_device_train_batch_size", type=int, default=48)
     p.add_argument("--gradient_accumulation_steps", type=int, default=1)
     p.add_argument("--learning_rate", type=float, default=1e-4)
     p.add_argument("--warmup_steps", type=int, default=100)
@@ -825,6 +950,11 @@ def parse_args(argv: Optional[List[str]] = None) -> Phase1Config:
     p.add_argument("--remaining_colab_hours", type=float, default=45.0)
     p.add_argument("--project_after_minutes", type=float, default=10.0)
     p.add_argument("--no_packing", action="store_true", help="Disable sample packing")
+    p.add_argument(
+        "--no_strip_vision",
+        action="store_true",
+        help="Keep vision tower/config (disables text-only packing path)",
+    )
     p.add_argument("--no_push_to_hub", action="store_true")
     args = p.parse_args(argv)
 
@@ -852,6 +982,7 @@ def parse_args(argv: Optional[List[str]] = None) -> Phase1Config:
         remaining_colab_hours=args.remaining_colab_hours,
         project_after_minutes=args.project_after_minutes,
         packing=not args.no_packing,
+        strip_vision=not args.no_strip_vision,
         push_to_hub=not args.no_push_to_hub,
     )
 

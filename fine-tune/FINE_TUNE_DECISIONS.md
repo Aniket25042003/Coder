@@ -124,10 +124,11 @@ Full FT for ~15–25B tokens needs weeks on one A100 and far more than ~300 Cola
 | Knob | Value | Notes |
 | --- | --- | --- |
 | `max_seq_len` | **2048** | Prefer over 4096 when maximizing tokens/credit |
-| `per_device_train_batch_size` | **40** (try **48+**) | Fill toward **35–38GB** peak on 40GB A100 |
+| `per_device_train_batch_size` | **48** (try **56+** if peak &lt; ~30GB) | Fill toward **35–38GB** peak on 40GB A100 |
 | `gradient_accumulation_steps` | **1** | Prefer real batch over fake accum for throughput |
 | FLA stack | **`flash-linear-attention` + `causal-conv1d`** | Required; otherwise torch fallback ≈ few k tok/s |
-| Packing | **On** via text tokenizer (not multimodal processor) | Confirm log: `Sample packing is ACTIVE` |
+| Packing | **On** via vision strip + text tokenizer | Confirm `Sample packing is ACTIVE` (script aborts if skipped) |
+| Vision strip | **On** (`strip_vision`) | Qwen3.5 Base is VLM-shaped; strip so Unsloth allows packing |
 | Logs | every **5** steps + **EARLY_PROJECTION** (~10 min) | Scale batch/seq from `tok/s` + `peak` VRAM |
 
 ### Throughput / success criteria
@@ -206,3 +207,4 @@ If Colab cannot reach ~5B: continue the **same LoRA run** on CloudRift 4090 / GC
 | 2026-07-12 | Phase 1 method (v2) | **LoRA** CPT, seq **2K–4K**, Unsloth-class stack, target **~5B tokens** on Colab; full FT deferred |
 | 2026-07-12 | Colab hardware / resume | Prefer **A100 40GB**; avoid 80GB for token-max; **mandatory multi-session resume** (≤~12 h sessions) via Hub/Drive ckpts |
 | 2026-07-12 | Train stack | Unsloth + transformers **v5+** + TRL packing CPT; **no QLoRA**; see `train_phase1.py` |
+| 2026-07-13 | Packing / throughput | Strip Qwen3.5 vision for text CPT; fail if packing inactive; Unsloth-before-transformers import; default batch **48** |
