@@ -3,7 +3,7 @@
 Phase 1 LoRA continued pretrain for Qwen3-4B-Base (Unsloth + TRL).
 
 Locked defaults: fine-tune/FINE_TUNE_DECISIONS.md
-  - Model: Qwen/Qwen3-4B-Base (BF16 LoRA, no QLoRA) — dense text LM; Unsloth patches apply
+  - Model: unsloth/Qwen3-4B-Base (BF16 LoRA, no QLoRA) — Unsloth mirror for fast Colab download
   - Data: Aniket200325/coder-pretrain-60gb (streaming, packed)
   - Seq: 2048 default (try 4096 only if tok/s wins), token budget ~5B
   - Colab: multi-session resume via local/Hub/Drive LATEST
@@ -45,7 +45,7 @@ import time
 import traceback
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence
+from typing import Any, Dict, List, Optional
 
 # CRITICAL: Unsloth must import before transformers / peft so its patches apply.
 # (Otherwise: "Unsloth should be imported before [transformers, peft]" + slower path.)
@@ -71,7 +71,7 @@ LOG = logging.getLogger("phase1")
 
 @dataclass
 class Phase1Config:
-    model_name: str = "Qwen/Qwen3-4B-Base"
+    model_name: str = "unsloth/Qwen3-4B-Base"
     dataset: str = "Aniket200325/coder-pretrain-60gb"
     data_dir: Optional[str] = None
     output_dir: str = "./ckpts/phase1-lora"
@@ -656,8 +656,6 @@ def _clear_hf_offline() -> None:
         val = os.environ.pop(key, None)
         if val is not None:
             LOG.warning("Cleared %s=%s (recover from incomplete model download)", key, val)
-    # Xet path has stalled mid-shard on Colab before; prefer classic LFS HTTP.
-    os.environ.setdefault("HF_HUB_DISABLE_XET", "1")
 
 
 def _hf_hub_cache_root() -> Path:
@@ -671,22 +669,6 @@ def _hub_repo_cache_dir(repo_id: str) -> Path:
     return _hf_hub_cache_root() / f"models--{repo_id.replace('/', '--')}"
 
 
-def _cache_has_weight_shards(repo_id: str) -> bool:
-    root = _hub_repo_cache_dir(repo_id)
-    if not root.is_dir():
-        return False
-    for path in root.rglob("*"):
-        name = path.name
-        if name.endswith(".safetensors") or name in ("pytorch_model.bin", "model.safetensors"):
-            # Incomplete LFS downloads are often tiny pointer leftovers.
-            if path.is_file() and path.stat().st_size > 1_000_000:
-                return True
-        if name.endswith(".safetensors.index.json") and path.is_file():
-            # Index alone is not enough; still require at least one large shard.
-            continue
-    return False
-
-
 def _purge_hub_repo_cache(repo_id: str) -> None:
     root = _hub_repo_cache_dir(repo_id)
     if root.exists():
@@ -694,55 +676,22 @@ def _purge_hub_repo_cache(repo_id: str) -> None:
         shutil.rmtree(root, ignore_errors=True)
 
 
-def _paired_model_ids(model_name: str) -> List[str]:
-    """Unsloth often remaps Qwen/* <-> unsloth/*; warm both caches when possible."""
-    ids = [model_name]
+def _fallback_model_id(model_name: str) -> Optional[str]:
     if model_name.startswith("unsloth/"):
-        other = "Qwen/" + model_name.split("/", 1)[1]
-        if other not in ids:
-            ids.append(other)
-    elif model_name.startswith("Qwen/"):
-        other = "unsloth/" + model_name.split("/", 1)[1]
-        if other not in ids:
-            ids.append(other)
-    return ids
+        return "Qwen/" + model_name.split("/", 1)[1]
+    if model_name.startswith("Qwen/"):
+        return "unsloth/" + model_name.split("/", 1)[1]
+    return None
 
 
-def _prefetch_model_weights(repo_ids: Sequence[str]) -> None:
-    """Download full weight shards before Unsloth can go offline on a partial cache."""
-    _clear_hf_offline()
+def _try_enable_hf_transfer() -> None:
+    """Optional faster Hub downloads when hf_transfer is installed (do not disable Xet)."""
     try:
-        from huggingface_hub import snapshot_download
-    except ImportError as e:
-        raise SystemExit("huggingface_hub is required to download model weights") from e
-
-    for repo_id in repo_ids:
-        if _cache_has_weight_shards(repo_id):
-            LOG.info("Hub cache for %s already has weight shards", repo_id)
-            continue
-        LOG.info(
-            "Prefetching %s weights (~8GB sharded safetensors; wait for finish before train)",
-            repo_id,
-        )
-        try:
-            snapshot_download(
-                repo_id=repo_id,
-                allow_patterns=[
-                    "*.json",
-                    "*.safetensors",
-                    "*.bin",
-                    "*.txt",
-                    "*.model",
-                    "tokenizer*",
-                    "vocab*",
-                    "merges*",
-                    "special_tokens*",
-                ],
-            )
-        except Exception as e:
-            LOG.warning("snapshot_download(%s) failed: %s", repo_id, e)
-        if not _cache_has_weight_shards(repo_id):
-            LOG.warning("After prefetch, %s still has no large weight shards", repo_id)
+        import hf_transfer  # noqa: F401
+    except ImportError:
+        return
+    os.environ.setdefault("HF_HUB_ENABLE_HF_TRANSFER", "1")
+    LOG.info("hf_transfer enabled for Hub downloads")
 
 
 def load_model_and_tokenizer(cfg: Phase1Config):
@@ -751,20 +700,34 @@ def load_model_and_tokenizer(cfg: Phase1Config):
     if cfg.strip_vision:
         _patch_unsloth_allow_packing()
 
+    # Prefer Unsloth's own FastLanguageModel download (often 1–3 min on Colab).
+    # Do NOT preemptively snapshot_download official mirrors with Xet disabled —
+    # that path was showing multi-hour ETAs for the same ~8GB shards.
+    _clear_hf_offline()
+    _try_enable_hf_transfer()
+
     model_name = cfg.model_name
-    paired = _paired_model_ids(model_name)
+    candidates = [model_name]
+    alt = _fallback_model_id(model_name)
+    if alt:
+        candidates.append(alt)
+
     LOG.info("Loading %s (BF16 LoRA, seq=%s, packing=%s)", model_name, cfg.max_seq_len, cfg.packing)
 
     last_err: Optional[BaseException] = None
     for recover in (False, True):
         _clear_hf_offline()
         if recover:
-            LOG.warning("Retrying model load after purging incomplete Hub caches: %s", paired)
-            for rid in paired:
+            LOG.warning(
+                "Recovering from incomplete weights: purge caches + retry "
+                "(only now may fall back to classic LFS if Xet stalled)"
+            )
+            for rid in candidates:
                 _purge_hub_repo_cache(rid)
-        _prefetch_model_weights(paired)
+            # Last-resort: if Xet previously stalled mid-shard, classic LFS can finish.
+            os.environ["HF_HUB_DISABLE_XET"] = "1"
 
-        for candidate in paired:
+        for candidate in candidates:
             try:
                 model, tokenizer_or_proc = FastLanguageModel.from_pretrained(
                     model_name=candidate,
@@ -785,10 +748,10 @@ def load_model_and_tokenizer(cfg: Phase1Config):
         break
     else:
         raise RuntimeError(
-            "Could not load Qwen3-4B-Base weights. Clear Hub cache and re-run:\n"
+            "Could not load Qwen3-4B-Base weights. On Colab run:\n"
             "  rm -rf ~/.cache/huggingface/hub/models--unsloth--Qwen3-4B-Base "
             "~/.cache/huggingface/hub/models--Qwen--Qwen3-4B-Base\n"
-            "Then: HF_HUB_DISABLE_XET=1 python train_phase1.py --model Qwen/Qwen3-4B-Base ..."
+            "Then: python train_phase1.py --model unsloth/Qwen3-4B-Base ..."
         ) from last_err
 
     tokenizer = _prepare_text_tokenizer(_as_text_tokenizer(tokenizer_or_proc))
