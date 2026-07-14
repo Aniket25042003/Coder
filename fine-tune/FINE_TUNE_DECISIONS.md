@@ -1,7 +1,7 @@
-# Fine-Tune Decisions — Qwen3-4B Domain CPT + SFT
+# Fine-Tune Decisions — Qwen2.5-Coder-3B Domain CPT + SFT
 
 Living document for fine-tuning choices.
-Goal: specialize a strong open 4B model for coding/security automation and PR review, deployable on Jetson Orin Nano 8GB and/or a small cloud machine.
+Goal: specialize a strong open ~3B coding model for coding/security automation and PR review, deployable on Jetson Orin Nano 8GB and/or a small cloud machine.
 
 Corpus (Phase 1): `Aniket200325/coder-pretrain-60gb` (~59 GB raw text; Phase 1 trains a **~5B-token** stratified/streaming slice under Colab budget, not necessarily a full epoch).  
 Phase 1.5 (optional): security / curated-repo CPT if Phase 1 under-delivers.  
@@ -14,40 +14,48 @@ Scratch (from-scratch) work lives in [`../scratch/`](../scratch/). This folder i
 ## 1. Base model (DECIDED)
 
 ### Choice
-- **Primary:** [`unsloth/Qwen3-4B-Base`](https://huggingface.co/unsloth/Qwen3-4B-Base) (fast Colab mirror) / [`Qwen/Qwen3-4B-Base`](https://huggingface.co/Qwen/Qwen3-4B-Base) fallback
-- **Fallback (Orin / quality):** `Qwen/Qwen2.5-Coder-7B` or `Qwen/Qwen2.5-Coder-3B` if Qwen3 deploy or throughput disappoints
+- **Primary:** [`unsloth/Qwen2.5-Coder-3B`](https://huggingface.co/unsloth/Qwen2.5-Coder-3B) (fast Colab mirror) / [`Qwen/Qwen2.5-Coder-3B`](https://huggingface.co/Qwen/Qwen2.5-Coder-3B) fallback
+- **Upsize option:** `unsloth/Qwen2.5-Coder-7B` if 3B quality ceiling is hit and Orin Q4 still fits
+- **Rejected for now:** `unsloth/Qwen3-4B-Base` — Unsloth fast CDN hang left incomplete Hub cache (`config.json` only; no weight shards) on Colab A100 (2026-07-14)
 
-### Why Base, not instruct
+### Why Coder-Base (not instruct, not Qwen3)
 | Checkpoint | Role | Fit for our plan |
 | --- | --- | --- |
-| **`Qwen3-4B-Base`** | Dense text foundation; Unsloth-native; packing + FA2 path | **Phase 1 corpus CPT → Phase 2 instruction SFT** |
-| **`Qwen3-4B` (instruct)** | Post-trained chat / reasoning | Skip as CPT start — would fight existing SFT/RL priors |
+| **`Qwen2.5-Coder-3B`** | Dense `Qwen2ForCausalLM`; code-pretrained base; Unsloth mirror; packing + FA2 | **Phase 1 corpus CPT → Phase 2 instruction SFT** |
+| **`Qwen2.5-Coder-*-Instruct`** | Chat / tool-tuned | Skip as CPT start |
+| **`Qwen3-4B-Base`** | Dense Qwen3 | Ideal on paper; Unsloth download path broken on our Colab stack |
+| **`Qwen3.5-4B-Base`** | VLM + hybrid linear attn | Packing blocked; FLA dependency |
 
-Our pipeline is **domain continued pretraining on the 60 GB corpus, then instruction fine-tuning**. That matches **Base**. Coding specialization comes from CPT on `coder-pretrain-60gb`, not from a Coder-branded base.
+### Why not Qwen3-4B-Base (attempted 2026-07-14)
+| Issue | Impact |
+| --- | --- |
+| Unsloth pauses ~2 min on `unslothai/colabpro` / `repeat` / `vram-40`, then `Offline mode: local_files_only=True` | Weights never finish downloading |
+| Cache holds `config.json` only | `OSError: no pytorch_model.bin or model.safetensors` |
+| Official `Qwen/Qwen3-4B-Base` remapped to same unsloth ID | Dual-candidate / prefetch / local_dir paths all hit the same wall |
 
 ### Why not Qwen3.5-4B-Base (superseded 2026-07-13)
 | Issue | Impact |
 | --- | --- |
-| Checkpoint is **VLM-shaped** (`Qwen3_5ForConditionalGeneration` + `vision_config`) | Unsloth **skips sample packing** even after vision strip |
-| Hybrid **linear attention** needs extra CUDA kernels | Colab install fragile; without them tok/s collapses to ~few k |
-| Measured ~6k tok/s without packing | ~5B tokens infeasible on ~45 Colab hours |
+| Checkpoint is **VLM-shaped** | Unsloth **skips sample packing** |
+| Hybrid **linear attention** needs extra CUDA kernels | Colab install fragile; tok/s collapses without them |
 
 ### Product / deploy constraints (locked intent)
 - Use cases: automation agents, PR review (bugs / issues / vulnerabilities).
 - Must be runnable on **Jetson Orin Nano 8GB** and/or a **small cloud** box.
 - Inference plan: **quantize** for edge (Q4/Q5 or INT8); do not assume full BF16 weights + long KV fit in 8GB.
-- Qwen3-4B is a standard dense transformer — broader Orin / llama.cpp support than Qwen3.5 hybrid.
+- Qwen2.5-Coder-3B is a standard dense transformer with strong coding priors — good Orin / llama.cpp fit.
 
 ### Explicitly rejected (for v1 start)
 | Option | Reason |
 | --- | --- |
-| `Qwen3.5-4B-Base` for Phase 1 CPT on Unsloth | Packing blocked + hybrid-attn kernel dependency (see above) |
+| `Qwen3-4B-Base` Phase 1 on current Unsloth Colab | Unreliable weight download (see above) |
+| `Qwen3.5-4B-Base` for Phase 1 CPT | Packing blocked + hybrid-attn kernels |
 | Start CPT from instruct checkpoints | Wrong stage for corpus continue-pretrain |
 | Jump to 7B+ as primary Jetson target | Tight/unreliable on 8GB with long PR context |
 | From-scratch SLM as the main line | Moved to `scratch/`; fine-tune path is primary product path |
 
 ### Status
-**LOCKED** — 2026-07-13 (switched from Qwen3.5 → Qwen3).
+**LOCKED** — 2026-07-14 (switched Qwen3.5 → Qwen3 → **Qwen2.5-Coder-3B**).
 
 ---
 
@@ -62,7 +70,7 @@ Our pipeline is **domain continued pretraining on the 60 GB corpus, then instruc
 | Goal | Verdict |
 | --- | --- |
 | From-scratch parity with lab coders | Not this path |
-| Domain CPT on Qwen3-4B-Base | **Yes** — a multi-billion-token LoRA CPT pass is useful |
+| Domain CPT on Qwen2.5-Coder-3B | **Yes** — a multi-billion-token LoRA CPT pass is useful |
 | Full corpus epoch on Colab credits alone | **No** — target a **~5B-token** slice instead |
 | PR/security reviewer after Phase 1 alone | **No** — needs instruction/task data later |
 
@@ -105,7 +113,7 @@ Add only if Phase 1 val/smoke shows weak domain lift or Phase 2 needs raw materi
 ## 3. Phase 1 method & budget (DECIDED) — Colab / LoRA revision
 
 ### Choice
-- **Method:** **LoRA** continued pretrain on `Qwen3-4B-Base` (primary). **Not** full FT for v1 Phase 1.
+- **Method:** **LoRA** continued pretrain on `Qwen2.5-Coder-3B` (primary). **Not** full FT for v1 Phase 1.
 - **Stack class:** **Unsloth-class** (or equivalent fused/fast LoRA trainer) + BF16 + FlashAttention2/xformers where available; minimize padding waste via packing.
 - **Seq length:** **2048–4096** (Colab A100 40GB default **2048** + large batch for tok/s; trial **4096** only if measured tok/s wins).
 - **Token target:** **~5B tokens** stretch on Colab; accept **~2–3B** if measured throughput can’t hit 5B.
@@ -134,7 +142,7 @@ Full FT for ~15–25B tokens needs weeks on one A100 and far more than ~300 Cola
 | `max_seq_len` | **2048** | Prefer over 4096 when maximizing tokens/credit |
 | `per_device_train_batch_size` | **48** (try **56+** if peak &lt; ~30GB) | Fill toward **35–38GB** peak on 40GB A100 |
 | `gradient_accumulation_steps` | **1** | Prefer real batch over fake accum for throughput |
-| Attention kernels | **FlashAttention2 / xformers** (optional but preferred) | Dense Qwen3 full-attn path |
+| Attention kernels | **FlashAttention2 / xformers** (optional but preferred) | Dense Qwen2 full-attn path |
 | Packing | **On** (text tokenizer / CausalLM) | Confirm `Sample packing is ACTIVE` (script aborts if skipped) |
 | Vision strip | **Off** by default | Only for VLM-shaped ckpts (`--strip_vision`) |
 | Logs | every **5** steps + **EARLY_PROJECTION** (~10 min) | Scale batch/seq from `tok/s` + `peak` VRAM |
@@ -190,7 +198,7 @@ If Colab cannot reach ~5B: continue the **same LoRA run** on CloudRift 4090 / GC
 | Layer | Choice |
 | --- | --- |
 | Trainer stack | **Unsloth** `FastLanguageModel` + TRL `SFTTrainer` / `SFTConfig` |
-| Transformers | **≥4.51** (Qwen3 support; v5 also fine) |
+| Transformers | **≥4.51** (Qwen2.5 / Unsloth; v5 also fine) |
 | Model load | BF16 / `load_in_16bit=True`; **`load_in_4bit=False`** |
 | QLoRA | **Rejected** for Phase 1 (quality / Unsloth guidance) |
 | Entry script | [`train_phase1.py`](train_phase1.py) + [`phase1_colab.ipynb`](phase1_colab.ipynb) |
@@ -217,4 +225,5 @@ If Colab cannot reach ~5B: continue the **same LoRA run** on CloudRift 4090 / GC
 | 2026-07-12 | Train stack | Unsloth + TRL packing CPT; **no QLoRA**; see `train_phase1.py` |
 | 2026-07-13 | Packing / throughput | Attempted Qwen3.5 vision strip; Unsloth still skipped packing → fatal guard |
 | 2026-07-13 | Base model (v2) | Switch to **`Qwen3-4B-Base`**; FA2/xformers path; packing on; batch **48** |
-| 2026-07-14 | Model weights load | Revert to **Unsloth `FastLanguageModel.from_pretrained`** (same path that worked for Qwen3.5); purge incomplete Hub cache on one retry |
+| 2026-07-14 | Model weights load | Revert to **Unsloth `FastLanguageModel.from_pretrained`**; purge incomplete Hub cache on one retry — still blocked on Qwen3-4B CDN |
+| 2026-07-14 | Base model (v3) | Switch to **`unsloth/Qwen2.5-Coder-3B`** (Coder base, packing OK, reliable Unsloth mirror) |

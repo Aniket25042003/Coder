@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """
-Phase 1 LoRA continued pretrain for Qwen3-4B-Base (Unsloth + TRL).
+Phase 1 LoRA continued pretrain for Qwen2.5-Coder-3B (Unsloth + TRL).
 
 Locked defaults: fine-tune/FINE_TUNE_DECISIONS.md
-  - Model: unsloth/Qwen3-4B-Base (BF16 LoRA, no QLoRA)
-  - Load: FastLanguageModel.from_pretrained (same Unsloth path as Qwen3.5)
+  - Model: unsloth/Qwen2.5-Coder-3B (BF16 LoRA, no QLoRA)
+  - Load: FastLanguageModel.from_pretrained (Unsloth fast download)
   - Data: Aniket200325/coder-pretrain-60gb (streaming, packed)
   - Seq: 2048 default (try 4096 only if tok/s wins), token budget ~5B
   - Colab: multi-session resume via local/Hub/Drive LATEST
@@ -21,10 +21,10 @@ Full Phase 1 (multi-session; resume after each ~12h Colab kill):
       --token_budget 5000000000 --max_seq_len 2048 \\
       --per_device_train_batch_size 48 --gradient_accumulation_steps 1 \\
       --output_dir ./ckpts/phase1-lora \\
-      --hub_model_id YOUR_USER/coder-qwen3-4b-phase1-lora \\
+      --hub_model_id YOUR_USER/coder-qwen25-coder-3b-phase1-lora \\
       --resume auto --ckpt_minutes 30 --logging_steps 5
 
-Speed path for Qwen3 (standard attention): Unsloth + FlashAttention2/xformers + packing.
+Speed path: Unsloth + FlashAttention2/xformers + packing (dense Qwen2 attention).
 
 First ~10–15 min: watch tok/s + VRAM (GB). Aim ~35–38 GB used.
   - Confirm: Sample packing is ACTIVE
@@ -72,7 +72,7 @@ LOG = logging.getLogger("phase1")
 
 @dataclass
 class Phase1Config:
-    model_name: str = "unsloth/Qwen3-4B-Base"
+    model_name: str = "unsloth/Qwen2.5-Coder-3B"
     dataset: str = "Aniket200325/coder-pretrain-60gb"
     data_dir: Optional[str] = None
     output_dir: str = "./ckpts/phase1-lora"
@@ -103,7 +103,7 @@ class Phase1Config:
     push_to_hub: bool = True
     project_after_minutes: float = 10.0  # early projection for batch/seq tuning
     packing: bool = True
-    strip_vision: bool = False  # Qwen3 is text-only; leave False unless loading a VLM ckpt
+    strip_vision: bool = False  # Qwen2.5-Coder is text-only; leave False unless loading a VLM ckpt
 
 
 # =============================================================================
@@ -462,7 +462,7 @@ def load_val_dataset(cfg: Phase1Config):
 
 
 def check_attention_fast_path() -> None:
-    """Qwen3 uses standard full attention — prefer FlashAttention2 / xformers."""
+    """Qwen2.5 uses standard full attention — prefer FlashAttention2 / xformers."""
     fa2 = False
     xformers_ok = False
     try:
@@ -683,7 +683,7 @@ def _purge_incomplete_hub_cache(repo_id: str) -> None:
 
 
 def load_model_and_tokenizer(cfg: Phase1Config):
-    """Same Unsloth load path that worked for Qwen3.5: let FastLanguageModel download."""
+    """Unsloth FastLanguageModel download path (works for Qwen2.5-Coder)."""
     check_attention_fast_path()
     if cfg.strip_vision:
         _patch_unsloth_allow_packing()
@@ -714,8 +714,8 @@ def load_model_and_tokenizer(cfg: Phase1Config):
             shutil.rmtree(cache, ignore_errors=True)
         # Also drop leftover local_dir from earlier download experiments
         for extra in (
+            Path("/content/models/unsloth--Qwen2.5-Coder-3B"),
             Path("/content/models/unsloth--Qwen3-4B-Base"),
-            Path("/content/models/Qwen--Qwen3-4B-Base"),
         ):
             if extra.exists():
                 shutil.rmtree(extra, ignore_errors=True)
@@ -964,7 +964,7 @@ def train(cfg: Phase1Config) -> None:
 
 
 def parse_args(argv: Optional[List[str]] = None) -> Phase1Config:
-    p = argparse.ArgumentParser(description="Phase 1 Unsloth LoRA CPT for Qwen3-4B-Base")
+    p = argparse.ArgumentParser(description="Phase 1 Unsloth LoRA CPT for Qwen2.5-Coder-3B")
     p.add_argument("--model", type=str, default=Phase1Config.model_name)
     p.add_argument("--dataset", type=str, default=Phase1Config.dataset)
     p.add_argument("--data_dir", type=str, default=None)
