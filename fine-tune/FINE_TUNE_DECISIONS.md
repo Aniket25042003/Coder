@@ -217,4 +217,4 @@ If Colab cannot reach ~5B: continue the **same LoRA run** on CloudRift 4090 / GC
 | 2026-07-12 | Train stack | Unsloth + TRL packing CPT; **no QLoRA**; see `train_phase1.py` |
 | 2026-07-13 | Packing / throughput | Attempted Qwen3.5 vision strip; Unsloth still skipped packing → fatal guard |
 | 2026-07-13 | Base model (v2) | Switch to **`Qwen3-4B-Base`**; FA2/xformers path; packing on; batch **48** |
-| 2026-07-14 | Model weights load | Prefer **`unsloth/Qwen3-4B-Base`** fast download; purge incomplete cache on retry (no slow dual prefetch / Xet-off by default) |
+| 2026-07-14 | Model weights load | Unsloth docs path: `HF_HUB_ENABLE_HF_TRANSFER=1` + `snapshot_download(local_dir=...)` then `FastModel.from_pretrained(local_dir)` (BF16 LoRA) |

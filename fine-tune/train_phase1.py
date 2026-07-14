@@ -3,7 +3,10 @@
 Phase 1 LoRA continued pretrain for Qwen3-4B-Base (Unsloth + TRL).
 
 Locked defaults: fine-tune/FINE_TUNE_DECISIONS.md
-  - Model: unsloth/Qwen3-4B-Base (BF16 LoRA, no QLoRA) — Unsloth mirror for fast Colab download
+  - Model: unsloth/Qwen3-4B-Base (BF16 LoRA, no QLoRA)
+  - Download: HF_HUB_ENABLE_HF_TRANSFER=1 + snapshot_download(local_dir=...) then FastModel.from_pretrained(local path)
+    # see: https://unsloth.ai/docs/models/tutorials/qwen3-how-to-run-and-fine-tune
+    #      https://huggingface.co/unsloth/Qwen3-4B-Base
   - Data: Aniket200325/coder-pretrain-60gb (streaming, packed)
   - Seq: 2048 default (try 4096 only if tok/s wins), token budget ~5B
   - Colab: multi-session resume via local/Hub/Drive LATEST
@@ -58,6 +61,11 @@ except ImportError as e:
         "or see requirements-phase1.txt / phase1_colab.ipynb"
     ) from e
 
+try:
+    from unsloth import FastModel as _FastModel
+except ImportError:  # older Unsloth
+    _FastModel = None  # type: ignore[misc, assignment]
+
 import torch
 from transformers import TrainerCallback, TrainerControl, TrainerState, TrainingArguments
 
@@ -72,6 +80,9 @@ LOG = logging.getLogger("phase1")
 @dataclass
 class Phase1Config:
     model_name: str = "unsloth/Qwen3-4B-Base"
+    # Unsloth docs: snapshot_download(..., local_dir=...) then load from that path.
+    # None → /content/models/<repo> on Colab, else ./models/<repo>
+    model_local_dir: Optional[str] = None
     dataset: str = "Aniket200325/coder-pretrain-60gb"
     data_dir: Optional[str] = None
     output_dir: str = "./ckpts/phase1-lora"
@@ -651,107 +662,197 @@ def _patch_unsloth_allow_packing() -> None:
 
 
 def _clear_hf_offline() -> None:
-    """Unsloth/HF may flip into offline after a stalled download; that locks a bad cache."""
+    """Unsloth may set offline after a stalled CDN check; clear so Hub can fetch again."""
     for key in ("HF_HUB_OFFLINE", "TRANSFORMERS_OFFLINE", "HF_DATASETS_OFFLINE"):
         val = os.environ.pop(key, None)
         if val is not None:
-            LOG.warning("Cleared %s=%s (recover from incomplete model download)", key, val)
+            LOG.warning("Cleared %s=%s", key, val)
 
 
-def _hf_hub_cache_root() -> Path:
-    if os.environ.get("HF_HUB_CACHE"):
-        return Path(os.environ["HF_HUB_CACHE"])
-    hf_home = Path(os.environ.get("HF_HOME", Path.home() / ".cache" / "huggingface"))
-    return hf_home / "hub"
+def _canonical_weight_repo(model_name: str) -> str:
+    """Map Qwen/Qwen3-* → unsloth/Qwen3-* (HF card + Unsloth remapping)."""
+    if model_name.startswith("Qwen/") and "Qwen3" in model_name:
+        mapped = "unsloth/" + model_name.split("/", 1)[1]
+        LOG.info("Using Unsloth mirror %s (requested %s)", mapped, model_name)
+        return mapped
+    return model_name
 
 
-def _hub_repo_cache_dir(repo_id: str) -> Path:
-    return _hf_hub_cache_root() / f"models--{repo_id.replace('/', '--')}"
+def _default_model_local_dir(repo_id: str) -> Path:
+    slug = repo_id.replace("/", "--")
+    if Path("/content").is_dir():
+        return Path("/content/models") / slug
+    return Path("models") / slug
 
 
-def _purge_hub_repo_cache(repo_id: str) -> None:
-    root = _hub_repo_cache_dir(repo_id)
-    if root.exists():
-        LOG.warning("Purging incomplete Hub cache for %s -> %s", repo_id, root)
-        shutil.rmtree(root, ignore_errors=True)
-
-
-def _fallback_model_id(model_name: str) -> Optional[str]:
-    if model_name.startswith("unsloth/"):
-        return "Qwen/" + model_name.split("/", 1)[1]
-    if model_name.startswith("Qwen/"):
-        return "unsloth/" + model_name.split("/", 1)[1]
-    return None
+def _resolve_model_local_dir(cfg: Phase1Config, repo_id: str) -> Path:
+    if cfg.model_local_dir:
+        return Path(cfg.model_local_dir)
+    return _default_model_local_dir(repo_id)
 
 
 def _try_enable_hf_transfer() -> None:
-    """Optional faster Hub downloads when hf_transfer is installed (do not disable Xet)."""
+    """Unsloth Qwen3 docs: pip install hf_transfer; HF_HUB_ENABLE_HF_TRANSFER=1."""
     try:
         import hf_transfer  # noqa: F401
     except ImportError:
+        LOG.info("hf_transfer not installed — `pip install -U hf_transfer` for faster downloads")
+        os.environ.pop("HF_HUB_ENABLE_HF_TRANSFER", None)
         return
-    os.environ.setdefault("HF_HUB_ENABLE_HF_TRANSFER", "1")
-    LOG.info("hf_transfer enabled for Hub downloads")
+    os.environ["HF_HUB_ENABLE_HF_TRANSFER"] = "1"
+    LOG.info("HF_HUB_ENABLE_HF_TRANSFER=1 (Unsloth-recommended hub download)")
+
+
+def _local_dir_weights_complete(local_dir: Path) -> bool:
+    local_dir = Path(local_dir)
+    index = local_dir / "model.safetensors.index.json"
+    if index.is_file():
+        try:
+            data = json.loads(index.read_text())
+        except Exception:
+            return False
+        shards = set(data.get("weight_map", {}).values())
+        if not shards:
+            return False
+        for shard in shards:
+            path = local_dir / shard
+            if not path.is_file() or path.stat().st_size < 1_000_000:
+                return False
+        return True
+    for name in ("model.safetensors", "pytorch_model.bin"):
+        path = local_dir / name
+        if path.is_file() and path.stat().st_size > 1_000_000:
+            return True
+    return False
+
+
+def _ensure_model_weights(repo_id: str, local_dir: Path) -> Path:
+    """
+    Official Unsloth download path (docs + HF card):
+
+      os.environ["HF_HUB_ENABLE_HF_TRANSFER"] = "1"
+      snapshot_download(repo_id="unsloth/Qwen3-4B-Base", local_dir=...)
+
+    Then load from local_dir so Unsloth never runs its flaky CDN 'fast download'.
+    https://unsloth.ai/docs/models/tutorials/qwen3-how-to-run-and-fine-tune
+    https://huggingface.co/unsloth/Qwen3-4B-Base
+    """
+    _clear_hf_offline()
+    _try_enable_hf_transfer()
+    local_dir = Path(local_dir)
+    local_dir.mkdir(parents=True, exist_ok=True)
+
+    if _local_dir_weights_complete(local_dir):
+        LOG.info("Local weights ready: %s", local_dir)
+        return local_dir
+
+    try:
+        from huggingface_hub import snapshot_download
+    except ImportError as e:
+        raise SystemExit("huggingface_hub is required — pip install -U huggingface_hub hf_transfer") from e
+
+    LOG.info(
+        "Downloading %s → %s (~8GB). Unsloth pattern: hf_transfer + snapshot_download(local_dir=...)",
+        repo_id,
+        local_dir,
+    )
+    snapshot_download(repo_id=repo_id, local_dir=str(local_dir))
+    if not _local_dir_weights_complete(local_dir):
+        raise RuntimeError(
+            f"Download finished but shards incomplete under {local_dir}. "
+            f"Delete that folder and retry."
+        )
+    LOG.info("Weight download complete: %s", local_dir)
+    return local_dir
+
+
+def _from_pretrained(model_path: str, max_seq_len: int):
+    """
+    HF card / Unsloth Qwen3 fine-tune API:
+
+      FastModel.from_pretrained(
+          model_name="unsloth/Qwen3-4B-Base",  # or local_dir
+          max_seq_length=2048,
+          load_in_4bit=False,   # we keep BF16 LoRA on A100 40GB
+          full_finetuning=False,
+      )
+    """
+    common = dict(
+        model_name=model_path,
+        max_seq_length=max_seq_len,
+        load_in_4bit=False,
+        full_finetuning=False,
+    )
+    if _FastModel is not None:
+        try:
+            model, tok = _FastModel.from_pretrained(**common)
+            LOG.info("Loaded via FastModel.from_pretrained(%s)", model_path)
+            return model, tok, _FastModel
+        except TypeError:
+            # older FastModel signature
+            model, tok = _FastModel.from_pretrained(
+                model_name=model_path,
+                max_seq_length=max_seq_len,
+                load_in_4bit=False,
+            )
+            LOG.info("Loaded via FastModel.from_pretrained(%s) (compat kwargs)", model_path)
+            return model, tok, _FastModel
+        except Exception as e:
+            LOG.warning("FastModel load failed (%s); falling back to FastLanguageModel", e)
+
+    model, tok = FastLanguageModel.from_pretrained(
+        model_name=model_path,
+        max_seq_length=max_seq_len,
+        load_in_4bit=False,
+        load_in_16bit=True,
+        full_finetuning=False,
+    )
+    LOG.info("Loaded via FastLanguageModel.from_pretrained(%s)", model_path)
+    return model, tok, FastLanguageModel
 
 
 def load_model_and_tokenizer(cfg: Phase1Config):
     check_attention_fast_path()
-    # Only needed if someone opts into strip_vision on a VLM-shaped ckpt
     if cfg.strip_vision:
         _patch_unsloth_allow_packing()
 
-    # Prefer Unsloth's own FastLanguageModel download (often 1–3 min on Colab).
-    # Do NOT preemptively snapshot_download official mirrors with Xet disabled —
-    # that path was showing multi-hour ETAs for the same ~8GB shards.
-    _clear_hf_offline()
-    _try_enable_hf_transfer()
-
-    model_name = cfg.model_name
-    candidates = [model_name]
-    alt = _fallback_model_id(model_name)
-    if alt:
-        candidates.append(alt)
-
-    LOG.info("Loading %s (BF16 LoRA, seq=%s, packing=%s)", model_name, cfg.max_seq_len, cfg.packing)
+    model_name = _canonical_weight_repo(cfg.model_name)
+    cfg.model_name = model_name
+    local_dir = _resolve_model_local_dir(cfg, model_name)
+    LOG.info(
+        "Loading %s from %s (BF16 LoRA, seq=%s, packing=%s)",
+        model_name,
+        local_dir,
+        cfg.max_seq_len,
+        cfg.packing,
+    )
 
     last_err: Optional[BaseException] = None
-    for recover in (False, True):
+    peft_api = FastLanguageModel
+    for attempt in range(2):
         _clear_hf_offline()
-        if recover:
-            LOG.warning(
-                "Recovering from incomplete weights: purge caches + retry "
-                "(only now may fall back to classic LFS if Xet stalled)"
-            )
-            for rid in candidates:
-                _purge_hub_repo_cache(rid)
-            # Last-resort: if Xet previously stalled mid-shard, classic LFS can finish.
+        if attempt == 1:
+            LOG.warning("Retry: wipe local model dir and re-download")
+            if local_dir.exists():
+                shutil.rmtree(local_dir, ignore_errors=True)
             os.environ["HF_HUB_DISABLE_XET"] = "1"
+            os.environ.pop("HF_HUB_ENABLE_HF_TRANSFER", None)
 
-        for candidate in candidates:
-            try:
-                model, tokenizer_or_proc = FastLanguageModel.from_pretrained(
-                    model_name=candidate,
-                    max_seq_length=cfg.max_seq_len,
-                    load_in_4bit=False,
-                    load_in_16bit=True,
-                    full_finetuning=False,
-                )
-                if candidate != cfg.model_name:
-                    LOG.info("Loaded weights via %s (requested %s)", candidate, cfg.model_name)
-                    cfg.model_name = candidate
-                break
-            except Exception as e:
-                last_err = e
-                LOG.warning("Failed loading %s: %s", candidate, e)
-        else:
-            continue
-        break
+        try:
+            path = _ensure_model_weights(model_name, local_dir)
+            model, tokenizer_or_proc, peft_api = _from_pretrained(str(path), cfg.max_seq_len)
+            break
+        except Exception as e:
+            last_err = e
+            LOG.warning("Load attempt %s failed: %s", attempt + 1, e)
     else:
         raise RuntimeError(
-            "Could not load Qwen3-4B-Base weights. On Colab run:\n"
-            "  rm -rf ~/.cache/huggingface/hub/models--unsloth--Qwen3-4B-Base "
-            "~/.cache/huggingface/hub/models--Qwen--Qwen3-4B-Base\n"
-            "Then: python train_phase1.py --model unsloth/Qwen3-4B-Base ..."
+            "Could not download/load weights. On Colab run:\n"
+            "  pip install -q -U huggingface_hub hf_transfer\n"
+            f"  rm -rf {local_dir}\n"
+            "  # then re-run train (or the notebook download cell)\n"
+            f"  HF_HUB_ENABLE_HF_TRANSFER=1 python -c \"from huggingface_hub import snapshot_download; "
+            f"snapshot_download('{model_name}', local_dir='{local_dir}')\""
         ) from last_err
 
     tokenizer = _prepare_text_tokenizer(_as_text_tokenizer(tokenizer_or_proc))
@@ -777,16 +878,16 @@ def load_model_and_tokenizer(cfg: Phase1Config):
         random_state=cfg.seed,
         max_seq_length=cfg.max_seq_len,
     )
-    # Vision finetune kwargs only matter on multimodal ckpts
     if cfg.strip_vision:
         peft_kwargs.update(_disable_vision_finetune_kwargs())
 
+    get_peft = getattr(peft_api, "get_peft_model", FastLanguageModel.get_peft_model)
     try:
-        model = FastLanguageModel.get_peft_model(model, **peft_kwargs)
+        model = get_peft(model, **peft_kwargs)
     except TypeError:
         for k in _disable_vision_finetune_kwargs():
             peft_kwargs.pop(k, None)
-        model = FastLanguageModel.get_peft_model(model, **peft_kwargs)
+        model = get_peft(model, **peft_kwargs)
 
     if cfg.strip_vision:
         root = getattr(model, "base_model", model)
@@ -1000,6 +1101,12 @@ def train(cfg: Phase1Config) -> None:
 def parse_args(argv: Optional[List[str]] = None) -> Phase1Config:
     p = argparse.ArgumentParser(description="Phase 1 Unsloth LoRA CPT for Qwen3-4B-Base")
     p.add_argument("--model", type=str, default=Phase1Config.model_name)
+    p.add_argument(
+        "--model_local_dir",
+        type=str,
+        default=None,
+        help="Local dir for Unsloth snapshot_download (default: /content/models/unsloth--Qwen3-4B-Base)",
+    )
     p.add_argument("--dataset", type=str, default=Phase1Config.dataset)
     p.add_argument("--data_dir", type=str, default=None)
     p.add_argument("--output_dir", type=str, default=Phase1Config.output_dir)
@@ -1032,6 +1139,7 @@ def parse_args(argv: Optional[List[str]] = None) -> Phase1Config:
 
     return Phase1Config(
         model_name=args.model,
+        model_local_dir=args.model_local_dir,
         dataset=args.dataset,
         data_dir=args.data_dir,
         output_dir=args.output_dir,
