@@ -7,7 +7,6 @@
 #   # optional speed: flash-attn / xformers (Unsloth often bundles kernel paths)
 #
 # Model: Qwen3-4B-Base (dense text LM). Do NOT use QLoRA for Phase 1.
-# FLA (flash-linear-attention) is NOT required — that was for Qwen3.5 hybrid only.
 
 torch>=2.5.0
 transformers>=4.51.0

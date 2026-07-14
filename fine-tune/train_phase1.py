@@ -24,7 +24,6 @@ Full Phase 1 (multi-session; resume after each ~12h Colab kill):
       --resume auto --ckpt_minutes 30 --logging_steps 5
 
 Speed path for Qwen3 (standard attention): Unsloth + FlashAttention2/xformers + packing.
-FLA (flash-linear-attention) is NOT used — that was for Qwen3.5 hybrid linear-attn only.
 
 First ~10–15 min: watch tok/s + VRAM (GB). Aim ~35–38 GB used.
   - Confirm: Sample packing is ACTIVE; FA2 or xformers available if possible
@@ -461,7 +460,7 @@ def load_val_dataset(cfg: Phase1Config):
 
 
 def check_attention_fast_path() -> None:
-    """Qwen3 uses standard full attention — prefer FlashAttention2 / xformers (not FLA)."""
+    """Qwen3 uses standard full attention — prefer FlashAttention2 / xformers."""
     fa2 = False
     xformers_ok = False
     try:
@@ -508,8 +507,7 @@ def check_attention_fast_path() -> None:
     else:
         LOG.warning(
             "Neither flash_attn nor xformers detected. Unsloth may still patch kernels, "
-            "but install flash-attn or xformers if tok/s stays low. "
-            "FLA is not required for Qwen3 (that was Qwen3.5 hybrid only)."
+            "but install flash-attn or xformers if tok/s stays low."
         )
 
 

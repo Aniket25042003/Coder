@@ -29,7 +29,7 @@ Our pipeline is **domain continued pretraining on the 60 GB corpus, then instruc
 | Issue | Impact |
 | --- | --- |
 | Checkpoint is **VLM-shaped** (`Qwen3_5ForConditionalGeneration` + `vision_config`) | Unsloth **skips sample packing** even after vision strip |
-| Hybrid **linear attention** needs FLA (`flash-linear-attention` + `causal-conv1d`) | Colab install fragile; without FLA tok/s collapses to ~few k |
+| Hybrid **linear attention** needs extra CUDA kernels | Colab install fragile; without them tok/s collapses to ~few k |
 | Measured ~6k tok/s without packing | ~5B tokens infeasible on ~45 Colab hours |
 
 ### Product / deploy constraints (locked intent)
@@ -41,7 +41,7 @@ Our pipeline is **domain continued pretraining on the 60 GB corpus, then instruc
 ### Explicitly rejected (for v1 start)
 | Option | Reason |
 | --- | --- |
-| `Qwen3.5-4B-Base` for Phase 1 CPT on Unsloth | Packing blocked + FLA dependency (see above) |
+| `Qwen3.5-4B-Base` for Phase 1 CPT on Unsloth | Packing blocked + hybrid-attn kernel dependency (see above) |
 | Start CPT from instruct checkpoints | Wrong stage for corpus continue-pretrain |
 | Jump to 7B+ as primary Jetson target | Tight/unreliable on 8GB with long PR context |
 | From-scratch SLM as the main line | Moved to `scratch/`; fine-tune path is primary product path |
@@ -134,7 +134,7 @@ Full FT for ~15–25B tokens needs weeks on one A100 and far more than ~300 Cola
 | `max_seq_len` | **2048** | Prefer over 4096 when maximizing tokens/credit |
 | `per_device_train_batch_size` | **48** (try **56+** if peak &lt; ~30GB) | Fill toward **35–38GB** peak on 40GB A100 |
 | `gradient_accumulation_steps` | **1** | Prefer real batch over fake accum for throughput |
-| Attention kernels | **FlashAttention2 / xformers** (optional but preferred) | Dense Qwen3 full-attn path; **no FLA** |
+| Attention kernels | **FlashAttention2 / xformers** (optional but preferred) | Dense Qwen3 full-attn path |
 | Packing | **On** (text tokenizer / CausalLM) | Confirm `Sample packing is ACTIVE` (script aborts if skipped) |
 | Vision strip | **Off** by default | Only for VLM-shaped ckpts (`--strip_vision`) |
 | Logs | every **5** steps + **EARLY_PROJECTION** (~10 min) | Scale batch/seq from `tok/s` + `peak` VRAM |
@@ -193,7 +193,6 @@ If Colab cannot reach ~5B: continue the **same LoRA run** on CloudRift 4090 / GC
 | Transformers | **≥4.51** (Qwen3 support; v5 also fine) |
 | Model load | BF16 / `load_in_16bit=True`; **`load_in_4bit=False`** |
 | QLoRA | **Rejected** for Phase 1 (quality / Unsloth guidance) |
-| FLA | **Not used** (Qwen3.5-only; see `install_fla_stack.py` legacy) |
 | Entry script | [`train_phase1.py`](train_phase1.py) + [`phase1_colab.ipynb`](phase1_colab.ipynb) |
 
 ### Still TBD (later sections)
@@ -217,4 +216,4 @@ If Colab cannot reach ~5B: continue the **same LoRA run** on CloudRift 4090 / GC
 | 2026-07-12 | Colab hardware / resume | Prefer **A100 40GB**; avoid 80GB for token-max; **mandatory multi-session resume** (≤~12 h sessions) via Hub/Drive ckpts |
 | 2026-07-12 | Train stack | Unsloth + TRL packing CPT; **no QLoRA**; see `train_phase1.py` |
 | 2026-07-13 | Packing / throughput | Attempted Qwen3.5 vision strip; Unsloth still skipped packing → fatal guard |
-| 2026-07-13 | Base model (v2) | Switch to **`Qwen3-4B-Base`**; drop FLA; FA2/xformers path; packing on; batch **48** |
+| 2026-07-13 | Base model (v2) | Switch to **`Qwen3-4B-Base`**; FA2/xformers path; packing on; batch **48** |
