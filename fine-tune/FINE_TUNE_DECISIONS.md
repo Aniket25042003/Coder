@@ -14,7 +14,7 @@ Scratch (from-scratch) work lives in [`../scratch/`](../scratch/). This folder i
 ## 1. Base model (DECIDED)
 
 ### Choice
-- **Primary:** [`unsloth/Qwen3-4B-Base`](https://huggingface.co/unsloth/Qwen3-4B-Base) / [`Qwen/Qwen3-4B-Base`](https://huggingface.co/Qwen/Qwen3-4B-Base)
+- **Primary:** [`Qwen/Qwen3-4B-Base`](https://huggingface.co/Qwen/Qwen3-4B-Base) (Unsloth patches; [`unsloth/Qwen3-4B-Base`](https://huggingface.co/unsloth/Qwen3-4B-Base) mirror also OK if cache is complete)
 - **Fallback (Orin / quality):** `Qwen/Qwen2.5-Coder-7B` or `Qwen/Qwen2.5-Coder-3B` if Qwen3 deploy or throughput disappoints
 
 ### Why Base, not instruct
@@ -217,3 +217,4 @@ If Colab cannot reach ~5B: continue the **same LoRA run** on CloudRift 4090 / GC
 | 2026-07-12 | Train stack | Unsloth + TRL packing CPT; **no QLoRA**; see `train_phase1.py` |
 | 2026-07-13 | Packing / throughput | Attempted Qwen3.5 vision strip; Unsloth still skipped packing → fatal guard |
 | 2026-07-13 | Base model (v2) | Switch to **`Qwen3-4B-Base`**; FA2/xformers path; packing on; batch **48** |
+| 2026-07-14 | Model weights load | Default **`Qwen/Qwen3-4B-Base`**; prefetch shards + purge incomplete Hub cache (Unsloth offline remaps) |

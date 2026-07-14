@@ -4,7 +4,6 @@
 #   pip install -r requirements-phase1.txt
 #   # or Unsloth's recommended Colab install snippet, then:
 #   pip install "transformers>=4.51.0" datasets trl peft accelerate huggingface_hub
-#   # optional speed: flash-attn / xformers (Unsloth often bundles kernel paths)
 #
 # Model: Qwen3-4B-Base (dense text LM). Do NOT use QLoRA for Phase 1.
 
@@ -19,9 +18,7 @@ safetensors>=0.4.5
 sentencepiece>=0.2.0
 protobuf>=4.25.0
 tqdm>=4.66.0
-# Optional full-attention speedups (preferred over SDPA alone when available):
-#   pip install xformers
-#   pip install flash-attn --no-build-isolation   # may fail on Colab; Unsloth often enough
+# Optional (wheel only): pip install xformers
 # Install Unsloth for your platform, e.g.:
 #   pip install "unsloth[colab-new] @ git+https://github.com/unslothai/unsloth.git"
 # or follow https://unsloth.ai/docs/get-started/install

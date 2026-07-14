@@ -3,7 +3,7 @@
 Phase 1 LoRA continued pretrain for Qwen3-4B-Base (Unsloth + TRL).
 
 Locked defaults: fine-tune/FINE_TUNE_DECISIONS.md
-  - Model: unsloth/Qwen3-4B-Base (BF16 LoRA, no QLoRA) — dense text LM, not Qwen3.5 VLM/hybrid
+  - Model: Qwen/Qwen3-4B-Base (BF16 LoRA, no QLoRA) — dense text LM; Unsloth patches apply
   - Data: Aniket200325/coder-pretrain-60gb (streaming, packed)
   - Seq: 2048 default (try 4096 only if tok/s wins), token budget ~5B
   - Colab: multi-session resume via local/Hub/Drive LATEST
@@ -26,7 +26,7 @@ Full Phase 1 (multi-session; resume after each ~12h Colab kill):
 Speed path for Qwen3 (standard attention): Unsloth + FlashAttention2/xformers + packing.
 
 First ~10–15 min: watch tok/s + VRAM (GB). Aim ~35–38 GB used.
-  - Confirm: Sample packing is ACTIVE; FA2 or xformers available if possible
+  - Confirm: Sample packing is ACTIVE
   - If VRAM < 30 GB → raise --per_device_train_batch_size (56+)
   - If OOM → lower batch (40 → 32) or keep seq 2048
   - Optional: trial --max_seq_len 4096 with smaller batch; keep whichever tok/s wins
@@ -39,12 +39,13 @@ import json
 import logging
 import math
 import os
+import shutil
 import sys
 import time
 import traceback
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Sequence
 
 # CRITICAL: Unsloth must import before transformers / peft so its patches apply.
 # (Otherwise: "Unsloth should be imported before [transformers, peft]" + slower path.)
@@ -70,7 +71,7 @@ LOG = logging.getLogger("phase1")
 
 @dataclass
 class Phase1Config:
-    model_name: str = "unsloth/Qwen3-4B-Base"
+    model_name: str = "Qwen/Qwen3-4B-Base"
     dataset: str = "Aniket200325/coder-pretrain-60gb"
     data_dir: Optional[str] = None
     output_dir: str = "./ckpts/phase1-lora"
@@ -277,7 +278,7 @@ class TokenBudgetCallback(TrainerCallback):
         )
         if proj < 0.6 * self.cfg.token_budget:
             LOG.warning(
-                "Projection < 60%% of token_budget. Confirm packing ACTIVE + FA2/xformers; "
+                "Projection < 60%% of token_budget. Confirm packing ACTIVE; "
                 "then raise --per_device_train_batch_size (try 48+) before burning more credits; "
                 "keep --max_seq_len 2048 unless 4096 is faster."
             )
@@ -506,8 +507,7 @@ def check_attention_fast_path() -> None:
         )
     else:
         LOG.warning(
-            "Neither flash_attn nor xformers detected. Unsloth may still patch kernels, "
-            "but install flash-attn or xformers if tok/s stays low."
+            "Neither flash_attn nor xformers detected. Unsloth may still patch kernels — watch tok/s."
         )
 
 
@@ -650,6 +650,101 @@ def _patch_unsloth_allow_packing() -> None:
                 LOG.info("Patched %s.%s -> False (allow packing)", mod_name, name)
 
 
+def _clear_hf_offline() -> None:
+    """Unsloth/HF may flip into offline after a stalled download; that locks a bad cache."""
+    for key in ("HF_HUB_OFFLINE", "TRANSFORMERS_OFFLINE", "HF_DATASETS_OFFLINE"):
+        val = os.environ.pop(key, None)
+        if val is not None:
+            LOG.warning("Cleared %s=%s (recover from incomplete model download)", key, val)
+    # Xet path has stalled mid-shard on Colab before; prefer classic LFS HTTP.
+    os.environ.setdefault("HF_HUB_DISABLE_XET", "1")
+
+
+def _hf_hub_cache_root() -> Path:
+    if os.environ.get("HF_HUB_CACHE"):
+        return Path(os.environ["HF_HUB_CACHE"])
+    hf_home = Path(os.environ.get("HF_HOME", Path.home() / ".cache" / "huggingface"))
+    return hf_home / "hub"
+
+
+def _hub_repo_cache_dir(repo_id: str) -> Path:
+    return _hf_hub_cache_root() / f"models--{repo_id.replace('/', '--')}"
+
+
+def _cache_has_weight_shards(repo_id: str) -> bool:
+    root = _hub_repo_cache_dir(repo_id)
+    if not root.is_dir():
+        return False
+    for path in root.rglob("*"):
+        name = path.name
+        if name.endswith(".safetensors") or name in ("pytorch_model.bin", "model.safetensors"):
+            # Incomplete LFS downloads are often tiny pointer leftovers.
+            if path.is_file() and path.stat().st_size > 1_000_000:
+                return True
+        if name.endswith(".safetensors.index.json") and path.is_file():
+            # Index alone is not enough; still require at least one large shard.
+            continue
+    return False
+
+
+def _purge_hub_repo_cache(repo_id: str) -> None:
+    root = _hub_repo_cache_dir(repo_id)
+    if root.exists():
+        LOG.warning("Purging incomplete Hub cache for %s -> %s", repo_id, root)
+        shutil.rmtree(root, ignore_errors=True)
+
+
+def _paired_model_ids(model_name: str) -> List[str]:
+    """Unsloth often remaps Qwen/* <-> unsloth/*; warm both caches when possible."""
+    ids = [model_name]
+    if model_name.startswith("unsloth/"):
+        other = "Qwen/" + model_name.split("/", 1)[1]
+        if other not in ids:
+            ids.append(other)
+    elif model_name.startswith("Qwen/"):
+        other = "unsloth/" + model_name.split("/", 1)[1]
+        if other not in ids:
+            ids.append(other)
+    return ids
+
+
+def _prefetch_model_weights(repo_ids: Sequence[str]) -> None:
+    """Download full weight shards before Unsloth can go offline on a partial cache."""
+    _clear_hf_offline()
+    try:
+        from huggingface_hub import snapshot_download
+    except ImportError as e:
+        raise SystemExit("huggingface_hub is required to download model weights") from e
+
+    for repo_id in repo_ids:
+        if _cache_has_weight_shards(repo_id):
+            LOG.info("Hub cache for %s already has weight shards", repo_id)
+            continue
+        LOG.info(
+            "Prefetching %s weights (~8GB sharded safetensors; wait for finish before train)",
+            repo_id,
+        )
+        try:
+            snapshot_download(
+                repo_id=repo_id,
+                allow_patterns=[
+                    "*.json",
+                    "*.safetensors",
+                    "*.bin",
+                    "*.txt",
+                    "*.model",
+                    "tokenizer*",
+                    "vocab*",
+                    "merges*",
+                    "special_tokens*",
+                ],
+            )
+        except Exception as e:
+            LOG.warning("snapshot_download(%s) failed: %s", repo_id, e)
+        if not _cache_has_weight_shards(repo_id):
+            LOG.warning("After prefetch, %s still has no large weight shards", repo_id)
+
+
 def load_model_and_tokenizer(cfg: Phase1Config):
     check_attention_fast_path()
     # Only needed if someone opts into strip_vision on a VLM-shaped ckpt
@@ -657,29 +752,44 @@ def load_model_and_tokenizer(cfg: Phase1Config):
         _patch_unsloth_allow_packing()
 
     model_name = cfg.model_name
+    paired = _paired_model_ids(model_name)
     LOG.info("Loading %s (BF16 LoRA, seq=%s, packing=%s)", model_name, cfg.max_seq_len, cfg.packing)
-    try:
-        model, tokenizer_or_proc = FastLanguageModel.from_pretrained(
-            model_name=model_name,
-            max_seq_length=cfg.max_seq_len,
-            load_in_4bit=False,
-            load_in_16bit=True,
-            full_finetuning=False,
-        )
-    except Exception as e:
-        if model_name.startswith("unsloth/"):
-            alt = "Qwen/Qwen3-4B-Base"
-            LOG.warning("Failed loading %s (%s); falling back to %s", model_name, e, alt)
-            model, tokenizer_or_proc = FastLanguageModel.from_pretrained(
-                model_name=alt,
-                max_seq_length=cfg.max_seq_len,
-                load_in_4bit=False,
-                load_in_16bit=True,
-                full_finetuning=False,
-            )
-            cfg.model_name = alt
+
+    last_err: Optional[BaseException] = None
+    for recover in (False, True):
+        _clear_hf_offline()
+        if recover:
+            LOG.warning("Retrying model load after purging incomplete Hub caches: %s", paired)
+            for rid in paired:
+                _purge_hub_repo_cache(rid)
+        _prefetch_model_weights(paired)
+
+        for candidate in paired:
+            try:
+                model, tokenizer_or_proc = FastLanguageModel.from_pretrained(
+                    model_name=candidate,
+                    max_seq_length=cfg.max_seq_len,
+                    load_in_4bit=False,
+                    load_in_16bit=True,
+                    full_finetuning=False,
+                )
+                if candidate != cfg.model_name:
+                    LOG.info("Loaded weights via %s (requested %s)", candidate, cfg.model_name)
+                    cfg.model_name = candidate
+                break
+            except Exception as e:
+                last_err = e
+                LOG.warning("Failed loading %s: %s", candidate, e)
         else:
-            raise
+            continue
+        break
+    else:
+        raise RuntimeError(
+            "Could not load Qwen3-4B-Base weights. Clear Hub cache and re-run:\n"
+            "  rm -rf ~/.cache/huggingface/hub/models--unsloth--Qwen3-4B-Base "
+            "~/.cache/huggingface/hub/models--Qwen--Qwen3-4B-Base\n"
+            "Then: HF_HUB_DISABLE_XET=1 python train_phase1.py --model Qwen/Qwen3-4B-Base ..."
+        ) from last_err
 
     tokenizer = _prepare_text_tokenizer(_as_text_tokenizer(tokenizer_or_proc))
 
