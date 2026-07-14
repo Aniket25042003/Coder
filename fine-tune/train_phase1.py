@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
-Phase 1 LoRA continued pretrain for Qwen3.5-4B-Base (Unsloth + TRL).
+Phase 1 LoRA continued pretrain for Qwen3-4B-Base (Unsloth + TRL).
 
 Locked defaults: fine-tune/FINE_TUNE_DECISIONS.md
-  - Model: unsloth/Qwen3.5-4B-Base (BF16 LoRA, no QLoRA)
+  - Model: unsloth/Qwen3-4B-Base (BF16 LoRA, no QLoRA) — dense text LM, not Qwen3.5 VLM/hybrid
   - Data: Aniket200325/coder-pretrain-60gb (streaming, packed)
   - Seq: 2048 default (try 4096 only if tok/s wins), token budget ~5B
   - Colab: multi-session resume via local/Hub/Drive LATEST
@@ -20,14 +20,14 @@ Full Phase 1 (multi-session; resume after each ~12h Colab kill):
       --token_budget 5000000000 --max_seq_len 2048 \\
       --per_device_train_batch_size 48 --gradient_accumulation_steps 1 \\
       --output_dir ./ckpts/phase1-lora \\
-      --hub_model_id YOUR_USER/coder-qwen35-4b-phase1-lora \\
+      --hub_model_id YOUR_USER/coder-qwen3-4b-phase1-lora \\
       --resume auto --ckpt_minutes 30 --logging_steps 5
 
-Requires FLA stack for Qwen3.5 speed (Colab install cell / install_fla_stack.py):
-  flash-linear-attention + causal-conv1d (Dao-AILab wheel on torch 2.11)
+Speed path for Qwen3 (standard attention): Unsloth + FlashAttention2/xformers + packing.
+FLA (flash-linear-attention) is NOT used — that was for Qwen3.5 hybrid linear-attn only.
 
 First ~10–15 min: watch tok/s + VRAM (GB). Aim ~35–38 GB used.
-  - Confirm: Sample packing is ACTIVE; no "fast path is not available"
+  - Confirm: Sample packing is ACTIVE; FA2 or xformers available if possible
   - If VRAM < 30 GB → raise --per_device_train_batch_size (56+)
   - If OOM → lower batch (40 → 32) or keep seq 2048
   - Optional: trial --max_seq_len 4096 with smaller batch; keep whichever tok/s wins
@@ -71,7 +71,7 @@ LOG = logging.getLogger("phase1")
 
 @dataclass
 class Phase1Config:
-    model_name: str = "unsloth/Qwen3.5-4B-Base"
+    model_name: str = "unsloth/Qwen3-4B-Base"
     dataset: str = "Aniket200325/coder-pretrain-60gb"
     data_dir: Optional[str] = None
     output_dir: str = "./ckpts/phase1-lora"
@@ -102,7 +102,7 @@ class Phase1Config:
     push_to_hub: bool = True
     project_after_minutes: float = 10.0  # early projection for batch/seq tuning
     packing: bool = True
-    strip_vision: bool = True  # required for Unsloth packing on Qwen3.5
+    strip_vision: bool = False  # Qwen3 is text-only; leave False unless loading a VLM ckpt
 
 
 # =============================================================================
@@ -278,7 +278,7 @@ class TokenBudgetCallback(TrainerCallback):
         )
         if proj < 0.6 * self.cfg.token_budget:
             LOG.warning(
-                "Projection < 60%% of token_budget. Confirm FLA fast path + packing ACTIVE; "
+                "Projection < 60%% of token_budget. Confirm packing ACTIVE + FA2/xformers; "
                 "then raise --per_device_train_batch_size (try 48+) before burning more credits; "
                 "keep --max_seq_len 2048 unless 4096 is faster."
             )
@@ -460,58 +460,56 @@ def load_val_dataset(cfg: Phase1Config):
 # =============================================================================
 
 
-def check_fla_fast_path() -> None:
-    """Qwen3.5 hybrid layers need flash-linear-attention + causal-conv1d."""
-    fla_ok = False
-    conv_ok = False
+def check_attention_fast_path() -> None:
+    """Qwen3 uses standard full attention — prefer FlashAttention2 / xformers (not FLA)."""
+    fa2 = False
+    xformers_ok = False
     try:
-        import fla  # noqa: F401
+        import flash_attn  # noqa: F401
 
-        fla_ok = True
+        fa2 = True
     except ImportError:
-        try:
-            import flash_linear_attention  # noqa: F401
-
-            fla_ok = True
-        except ImportError:
-            LOG.warning(
-                "flash-linear-attention not installed — Qwen3.5 will use slow torch "
-                "linear-attention. Install: pip install 'flash-linear-attention[cuda]'"
-            )
+        pass
     try:
-        import causal_conv1d  # noqa: F401
+        import xformers  # noqa: F401
 
-        conv_ok = True
+        xformers_ok = True
     except ImportError:
-        LOG.warning(
-            "causal-conv1d not installed — Qwen3.5 fast path disabled. "
-            "Install: pip install causal-conv1d"
-        )
+        pass
 
     try:
         from transformers.utils import import_utils as iu
 
         for name in (
-            "is_flash_linear_attention_available",
-            "is_flash_linear_attn_available",
-            "is_causal_conv1d_available",
+            "is_flash_attn_2_available",
+            "is_flash_attn_available",
+            "is_xformers_available",
         ):
             fn = getattr(iu, name, None)
             if callable(fn):
                 try:
-                    LOG.info("%s -> %s", name, fn())
+                    val = fn()
+                    LOG.info("%s -> %s", name, val)
+                    if "flash_attn" in name and val:
+                        fa2 = True
+                    if "xformers" in name and val:
+                        xformers_ok = True
                 except Exception as e:  # noqa: BLE001
                     LOG.info("%s check failed: %s", name, e)
     except Exception:  # noqa: BLE001
         pass
 
-    if fla_ok and conv_ok:
-        LOG.info("FLA stack imports OK (flash-linear-attention + causal-conv1d)")
+    if fa2 or xformers_ok:
+        LOG.info(
+            "Attention fast path OK (flash_attn=%s xformers=%s)",
+            fa2,
+            xformers_ok,
+        )
     else:
         LOG.warning(
-            "FLA stack incomplete (fla=%s causal_conv1d=%s). Expect low tok/s until fixed.",
-            fla_ok,
-            conv_ok,
+            "Neither flash_attn nor xformers detected. Unsloth may still patch kernels, "
+            "but install flash-attn or xformers if tok/s stays low. "
+            "FLA is not required for Qwen3 (that was Qwen3.5 hybrid only)."
         )
 
 
@@ -655,11 +653,13 @@ def _patch_unsloth_allow_packing() -> None:
 
 
 def load_model_and_tokenizer(cfg: Phase1Config):
-    check_fla_fast_path()
-    _patch_unsloth_allow_packing()
+    check_attention_fast_path()
+    # Only needed if someone opts into strip_vision on a VLM-shaped ckpt
+    if cfg.strip_vision:
+        _patch_unsloth_allow_packing()
 
     model_name = cfg.model_name
-    LOG.info("Loading %s (BF16 LoRA, seq=%s, text-only packing path)", model_name, cfg.max_seq_len)
+    LOG.info("Loading %s (BF16 LoRA, seq=%s, packing=%s)", model_name, cfg.max_seq_len, cfg.packing)
     try:
         model, tokenizer_or_proc = FastLanguageModel.from_pretrained(
             model_name=model_name,
@@ -670,7 +670,7 @@ def load_model_and_tokenizer(cfg: Phase1Config):
         )
     except Exception as e:
         if model_name.startswith("unsloth/"):
-            alt = "Qwen/Qwen3.5-4B-Base"
+            alt = "Qwen/Qwen3-4B-Base"
             LOG.warning("Failed loading %s (%s); falling back to %s", model_name, e, alt)
             model, tokenizer_or_proc = FastLanguageModel.from_pretrained(
                 model_name=alt,
@@ -706,7 +706,9 @@ def load_model_and_tokenizer(cfg: Phase1Config):
         random_state=cfg.seed,
         max_seq_length=cfg.max_seq_len,
     )
-    peft_kwargs.update(_disable_vision_finetune_kwargs())
+    # Vision finetune kwargs only matter on multimodal ckpts
+    if cfg.strip_vision:
+        peft_kwargs.update(_disable_vision_finetune_kwargs())
 
     try:
         model = FastLanguageModel.get_peft_model(model, **peft_kwargs)
@@ -715,7 +717,6 @@ def load_model_and_tokenizer(cfg: Phase1Config):
             peft_kwargs.pop(k, None)
         model = FastLanguageModel.get_peft_model(model, **peft_kwargs)
 
-    # Re-assert text-only markers after PEFT wrap (wrappers sometimes re-expose config)
     if cfg.strip_vision:
         root = getattr(model, "base_model", model)
         root = getattr(root, "model", root)
@@ -835,8 +836,8 @@ def build_trainer(cfg: Phase1Config, model, tokenizer, train_ds, val_ds, phase_s
     if cfg.packing and not packing_on:
         raise SystemExit(
             "FATAL: packing requested but trainer.args.packing is False after SFTTrainer init. "
-            "Unsloth likely still treats the model as VLM (vision strip failed). "
-            "Do not burn credits — fix strip_vision / Unsloth version, or pass --no_packing."
+            "If you loaded a VLM-shaped model, try --strip_vision; otherwise check Unsloth/TRL. "
+            "Do not burn credits — or pass --no_packing only intentionally."
         )
     if packing_on:
         LOG.info("Sample packing is ACTIVE")
@@ -926,7 +927,7 @@ def train(cfg: Phase1Config) -> None:
 
 
 def parse_args(argv: Optional[List[str]] = None) -> Phase1Config:
-    p = argparse.ArgumentParser(description="Phase 1 Unsloth LoRA CPT for Qwen3.5-4B-Base")
+    p = argparse.ArgumentParser(description="Phase 1 Unsloth LoRA CPT for Qwen3-4B-Base")
     p.add_argument("--model", type=str, default=Phase1Config.model_name)
     p.add_argument("--dataset", type=str, default=Phase1Config.dataset)
     p.add_argument("--data_dir", type=str, default=None)
@@ -951,9 +952,9 @@ def parse_args(argv: Optional[List[str]] = None) -> Phase1Config:
     p.add_argument("--project_after_minutes", type=float, default=10.0)
     p.add_argument("--no_packing", action="store_true", help="Disable sample packing")
     p.add_argument(
-        "--no_strip_vision",
+        "--strip_vision",
         action="store_true",
-        help="Keep vision tower/config (disables text-only packing path)",
+        help="Strip vision tower/config (only needed for VLM-shaped ckpts like Qwen3.5)",
     )
     p.add_argument("--no_push_to_hub", action="store_true")
     args = p.parse_args(argv)
@@ -982,7 +983,7 @@ def parse_args(argv: Optional[List[str]] = None) -> Phase1Config:
         remaining_colab_hours=args.remaining_colab_hours,
         project_after_minutes=args.project_after_minutes,
         packing=not args.no_packing,
-        strip_vision=not args.no_strip_vision,
+        strip_vision=args.strip_vision,
         push_to_hub=not args.no_push_to_hub,
     )
 

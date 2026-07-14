@@ -1,5 +1,8 @@
 #!/usr/bin/env python3
-"""Install Qwen3.5 FLA fast-path deps (flash-linear-attention + causal-conv1d).
+"""Legacy: Qwen3.5 hybrid FLA deps (flash-linear-attention + causal-conv1d).
+
+Phase 1 now uses Qwen3-4B-Base (dense full attention) — do NOT run this for that path.
+Prefer xformers / flash-attn via phase1_colab.ipynb instead.
 
 Colab / recent torch often has no matching causal-conv1d PyPI wheel, so pip
 tries a source build and fails. This helper installs a Dao-AILab prebuilt wheel
