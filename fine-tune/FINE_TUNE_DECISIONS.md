@@ -1,7 +1,7 @@
-# Fine-Tune Decisions — Qwen2.5-Coder-3B Domain CPT + SFT
+# Fine-Tune Decisions — Qwen2.5-Coder-7B Domain CPT + SFT
 
 Living document for fine-tuning choices.
-Goal: specialize a strong open ~3B coding model for coding/security automation and PR review, deployable on Jetson Orin Nano 8GB and/or a small cloud machine.
+Goal: specialize a strong open **text-only** coder (~7B) for coding/security automation and PR review, deployable on Jetson Orin Nano 8GB and/or a small cloud machine.
 
 Corpus (Phase 1): `Aniket200325/coder-pretrain-60gb` (~59 GB raw text; Phase 1 trains a **~5B-token** stratified/streaming slice under Colab budget, not necessarily a full epoch).  
 Phase 1.5 (optional): security / curated-repo CPT if Phase 1 under-delivers.  
@@ -14,48 +14,44 @@ Scratch (from-scratch) work lives in [`../scratch/`](../scratch/). This folder i
 ## 1. Base model (DECIDED)
 
 ### Choice
-- **Primary:** [`unsloth/Qwen2.5-Coder-3B`](https://huggingface.co/unsloth/Qwen2.5-Coder-3B) (fast Colab mirror) / [`Qwen/Qwen2.5-Coder-3B`](https://huggingface.co/Qwen/Qwen2.5-Coder-3B) fallback
-- **Upsize option:** `unsloth/Qwen2.5-Coder-7B` if 3B quality ceiling is hit and Orin Q4 still fits
-- **Rejected for now:** `unsloth/Qwen3-4B-Base` — Unsloth fast CDN hang left incomplete Hub cache (`config.json` only; no weight shards) on Colab A100 (2026-07-14)
+- **Primary:** [`unsloth/Qwen2.5-Coder-7B`](https://huggingface.co/unsloth/Qwen2.5-Coder-7B) (**Base**, not Instruct)
+- **Not Phase 1:** `unsloth/Qwen2.5-Coder-7B-Instruct` — reserved for later comparison; Phase 2 SFT starts from Base CPT adapters
+- **Rejected lineage (2026-07):**
+  - Qwen3.5 / multimodal *ForConditionalGeneration* — packing skipped (VLM)
+  - Gemma 4 E4B — packing skipped (`vision-language model detected`) despite text tokenizer
+  - Qwen3-4B / Qwen2.5-Coder-3B earlier Colab attempts — CDN / incomplete-cache download failures (retry recipe now locked below)
 
-### Why Coder-Base (not instruct, not Qwen3)
+### Why Qwen2.5-Coder-7B Base
 | Checkpoint | Role | Fit for our plan |
 | --- | --- | --- |
-| **`Qwen2.5-Coder-3B`** | Dense `Qwen2ForCausalLM`; code-pretrained base; Unsloth mirror; packing + FA2 | **Phase 1 corpus CPT → Phase 2 instruction SFT** |
-| **`Qwen2.5-Coder-*-Instruct`** | Chat / tool-tuned | Skip as CPT start |
-| **`Qwen3-4B-Base`** | Dense Qwen3 | Ideal on paper; Unsloth download path broken on our Colab stack |
-| **`Qwen3.5-4B-Base`** | VLM + hybrid linear attn | Packing blocked; FLA dependency |
+| **`Qwen2.5-Coder-7B`** | Dense **text-only** Causal LM; coder-pretrained | **Phase 1 CPT → Phase 2 SFT**; Unsloth packing expected ACTIVE |
+| **`…-Instruct`** | Chat / tools | Skip as CPT start |
 
-### Why not Qwen3-4B-Base (attempted 2026-07-14)
-| Issue | Impact |
+### Packing constraint (locked)
+| Rule | Rationale |
 | --- | --- |
-| Unsloth pauses ~2 min on `unslothai/colabpro` / `repeat` / `vram-40`, then `Offline mode: local_files_only=True` | Weights never finish downloading |
-| Cache holds `config.json` only | `OSError: no pytorch_model.bin or model.safetensors` |
-| Official `Qwen/Qwen3-4B-Base` remapped to same unsloth ID | Dual-candidate / prefetch / local_dir paths all hit the same wall |
-
-### Why not Qwen3.5-4B-Base (superseded 2026-07-13)
-| Issue | Impact |
-| --- | --- |
-| Checkpoint is **VLM-shaped** | Unsloth **skips sample packing** |
-| Hybrid **linear attention** needs extra CUDA kernels | Colab install fragile; tok/s collapses without them |
+| Load with **`FastLanguageModel`** (not `FastVisionModel`) | Text Causal LM path |
+| Do **not** use `UnslothVisionDataCollator` | Vision SFT path skips packing |
+| No chat template in Phase 1 | CPT = full-token LM loss on `text` field |
+| Abort if `trainer.args.packing` is False | No silent no-packing CPT |
+| Prefer models **without** `vision_config` / not `*ForConditionalGeneration` | Unsloth VLM packing guard |
 
 ### Product / deploy constraints (locked intent)
 - Use cases: automation agents, PR review (bugs / issues / vulnerabilities).
 - Must be runnable on **Jetson Orin Nano 8GB** and/or a **small cloud** box.
 - Inference plan: **quantize** for edge (Q4/Q5 or INT8); do not assume full BF16 weights + long KV fit in 8GB.
-- Qwen2.5-Coder-3B is a standard dense transformer with strong coding priors — good Orin / llama.cpp fit.
 
-### Explicitly rejected (for v1 start)
+### Explicitly rejected (for v1 Phase 1)
 | Option | Reason |
 | --- | --- |
-| `Qwen3-4B-Base` Phase 1 on current Unsloth Colab | Unreliable weight download (see above) |
-| `Qwen3.5-4B-Base` for Phase 1 CPT | Packing blocked + hybrid-attn kernels |
-| Start CPT from instruct checkpoints | Wrong stage for corpus continue-pretrain |
-| Jump to 7B+ as primary Jetson target | Tight/unreliable on 8GB with long PR context |
+| Start CPT from Instruct | Wrong stage for corpus continue-pretrain |
+| QLoRA for Phase 1 | Quality lock: **BF16 LoRA only**; Phase 2 may revisit |
+| Quiet fallback if packing inactive | Burns Colab credits with bad tok/s |
+| Multimodal bases (Gemma 4 E4B, Qwen3.5, VL families) | Packing blocked by Unsloth VLM guard |
 | From-scratch SLM as the main line | Moved to `scratch/`; fine-tune path is primary product path |
 
 ### Status
-**LOCKED** — 2026-07-14 (switched Qwen3.5 → Qwen3 → **Qwen2.5-Coder-3B**).
+**LOCKED** — 2026-07-14 (**Qwen2.5-Coder-7B Base**).
 
 ---
 
@@ -70,146 +66,91 @@ Scratch (from-scratch) work lives in [`../scratch/`](../scratch/). This folder i
 | Goal | Verdict |
 | --- | --- |
 | From-scratch parity with lab coders | Not this path |
-| Domain CPT on Qwen2.5-Coder-3B | **Yes** — a multi-billion-token LoRA CPT pass is useful |
+| Domain CPT on Qwen2.5-Coder-7B | **Yes** — a multi-billion-token LoRA CPT pass is useful |
 | Full corpus epoch on Colab credits alone | **No** — target a **~5B-token** slice instead |
 | PR/security reviewer after Phase 1 alone | **No** — needs instruction/task data later |
 
-Approximate mix (finalized): code ~30 GB, FineWeb-Edu ~15 GB, docs ~10 GB, math ~3 GB, wiki ~2 GB, with dedup/decontam. Strength is general coding + technical text; gap is PR/vuln/review-specific signal — that gap is addressed post–Phase 1, not by more StarCoder-like bulk.
+Approximate mix (finalized): code ~30 GB, FineWeb-Edu ~15 GB, docs ~10 GB, math ~3 GB, wiki ~2 GB, with dedup/decontam.
 
 ### Token estimate (corpus vs Phase 1 compute)
 | Item | Estimate |
 | --- | --- |
 | Raw text (full corpus) | ~59 GB |
 | Tokens / full epoch (tokenizer-dependent) | **~15–25B** |
-| **Phase 1 compute target (Colab-first)** | **~5B tokens** stretch goal (stratified / streaming sample of the train split) |
+| **Phase 1 compute target (Colab-first)** | **~5B tokens** stretch goal |
 | Floor if throughput is weak | **~2–3B tokens** still counts as a useful CPT pass |
 
-Measure real **tok/s** in the first Colab hour and re-forecast: `tokens ≈ tok/s × 3600 × remaining_hours`. Do **not** assume a full 60 GB epoch on Colab credits alone.
-
-### Post–Phase 1 data (gated on performance)
-Add only if Phase 1 val/smoke shows weak domain lift or Phase 2 needs raw material:
-
-| Data type | Prefer stage | Role |
-| --- | --- | --- |
-| Security writeups / vuln↔patch pairs | **1.5 CPT and/or 2 SFT** | Security priors |
-| Issue ↔ PR / review comment threads | **2 SFT** (primary); light 1.5 if useful | PR-review task format |
-| Curated repo-level packs | **1.5 CPT** (long-context) or SFT with multi-file prompts | Multi-file reasoning |
-
-**Default:** skip Phase 1.5 if Phase 1 looks healthy → go straight to **Phase 2 SFT** and put security/PR data there.
-
-### Explicitly rejected
-| Option | Reason |
-| --- | --- |
-| Delay Phase 1 for another 100+ GB general GitHub | Low ROI vs starting CPT |
-| Multi-epoch hammer on the same 60 GB as the default | Overfit / forgetting risk; Colab budget can’t finish a full epoch anyway |
-| Expect Phase 1 alone to teach structured PR findings | Task skill → Phase 2 |
-| Assume full ~15–25B epoch on ~300 Colab credits | Not feasible; target **~5B** with LoRA optimizations |
+Measure real **tok/s** in the first Colab hour and re-forecast: `tokens ≈ tok/s × 3600 × remaining_hours`.
 
 ### Status
 **LOCKED** — 2026-07-12.
 
 ---
 
-## 3. Phase 1 method & budget (DECIDED) — Colab / LoRA revision
+## 3. Phase 1 method & budget (DECIDED)
 
 ### Choice
-- **Method:** **LoRA** continued pretrain on `Qwen2.5-Coder-3B` (primary). **Not** full FT for v1 Phase 1.
-- **Stack class:** **Unsloth-class** (or equivalent fused/fast LoRA trainer) + BF16 + FlashAttention2/xformers where available; minimize padding waste via packing.
-- **Seq length:** **2048–4096** (Colab A100 40GB default **2048** + large batch for tok/s; trial **4096** only if measured tok/s wins).
-- **Token target:** **~5B tokens** stretch on Colab; accept **~2–3B** if measured throughput can’t hit 5B.
-- **Data:** stream/sample from full `coder-pretrain-60gb` train split (shuffle + seed); no need to materialize a separate 5B-token export first.
-- **QLoRA:** only if BF16 LoRA OOMs on the assigned GPU; prefer BF16 LoRA on A100 40GB.
-- **Full FT:** deferred until more multi-GPU / non-Colab budget exists.
-
-### Why LoRA now (supersedes earlier full-FT preference)
-Full FT for ~15–25B tokens needs weeks on one A100 and far more than ~300 Colab credits. LoRA + shorter context + fast kernels is what makes a **~5B-token** Phase 1 conceivable on Colab A100 40GB.
+- **Method:** **BF16 LoRA** continued pretrain on `unsloth/Qwen2.5-Coder-7B`. **Not** full FT; **not** QLoRA for Phase 1.
+- **Loader:** Unsloth **`FastLanguageModel`** + TRL `SFTTrainer` / `SFTConfig`.
+- **Seq length:** **2048** default (trial **4096** only if measured tok/s wins).
+- **Token target:** **~5B** stretch; accept **~2–3B** if throughput cannot hit 5B.
+- **Data:** stream from `coder-pretrain-60gb` train split.
 
 ### LoRA knobs (Phase 1 defaults)
 | Knob | Value |
 | --- | --- |
-| Rank `r` | **64** (try **128** if VRAM allows and loss plateaus) |
-| Alpha | **`2r`** (e.g. 128 when r=64) |
-| Targets | All attention + MLP linears (Unsloth/PEFT defaults for the arch); leave embeds/LM head frozen unless ablations say otherwise |
-| Dropout | **0** for CPT |
-| Precision | **BF16** LoRA |
-| Peak LR | Higher than full FT CPT is OK for adapters — start **~1e-4** (tune 5e-5–2e-4); cosine + short warmup |
-| Packing | **On** — concat docs to `max_seq_len` with EOS; minimize pad |
-| FIM | **Off by default** for speed; optional later ≤20% on code |
+| Rank `r` | **64** |
+| Alpha | **128** (`2r`) |
+| Target modules | `q/k/v/o_proj`, `gate/up/down_proj` |
+| Dropout | **0** |
+| Precision | **BF16** LoRA (`load_in_4bit=False`) |
+| Peak LR | **~1e-4**; cosine + warmup |
+| Packing | **Required** — abort if inactive |
 
-### Colab A100 40GB throughput defaults (Phase 1 script / notebook)
+### Colab A100 40GB throughput defaults
 | Knob | Value | Notes |
 | --- | --- | --- |
-| `max_seq_len` | **2048** | Prefer over 4096 when maximizing tokens/credit |
-| `per_device_train_batch_size` | **48** (try **56+** if peak &lt; ~30GB) | Fill toward **35–38GB** peak on 40GB A100 |
-| `gradient_accumulation_steps` | **1** | Prefer real batch over fake accum for throughput |
-| Attention kernels | **FlashAttention2 / xformers** (optional but preferred) | Dense Qwen2 full-attn path |
-| Packing | **On** (text tokenizer / CausalLM) | Confirm `Sample packing is ACTIVE` (script aborts if skipped) |
-| Vision strip | **Off** by default | Only for VLM-shaped ckpts (`--strip_vision`) |
-| Logs | every **5** steps + **EARLY_PROJECTION** (~10 min) | Scale batch/seq from `tok/s` + `peak` VRAM |
-
-### Throughput / success criteria
-- Early (~10 min) and first-hour goal: push toward **~25–35k tok/s** sustained if possible (needed to approach 5B in ~40–50 useful hours).
-- If projection under 5B over remaining credits → raise batch (while peak VRAM < ~38GB), keep seq 2048, or lock a **2–3B** target and stop cleanly.
-- Prefer **A100 40GB** over 80GB unless 40GB OOMs after packing+high batch (80GB costs ~+23% credits; only worth it if tok/s rises more than that).
-
-### Phase 2 / 1.5 (intent only — details TBD)
-- **Phase 2:** instruction / PR SFT — continue with **LoRA** (merge or stack adapters as needed).
-- **Phase 1.5:** optional short CPT on security / curated-repo packs if Phase 1 under-delivers.
+| `max_seq_len` | **2048** | Prefer over 4096 for tokens/credit |
+| `per_device_train_batch_size` | **110** full (A100 80GB) / **2** smoke | Cut on OOM; peak ~32GB at batch 32 → room to fill 80GB |
+| `gradient_accumulation_steps` | **1** | Prefer real batch over accum |
+| Packing | **On** | Fatal if skipped |
+| Wall-clock stop | **11.5 h** | `should_training_stop` + `should_save` before Colab ~12h kill |
+| Logs | every **5** steps + **EARLY_PROJECTION** (~10 min) | Scale batch from tok/s + peak VRAM |
 
 ### Status
-**LOCKED** — 2026-07-12 (LoRA / 2K–4K / ~5B Colab-first).
+**LOCKED** — 2026-07-14 (Qwen2.5-Coder-7B / BF16 LoRA / packing-required).
 
 ---
 
 ## 4. Phase 1 hardware, Colab sessions & resume (DECIDED)
 
-### Hardware preference (Colab compute units)
-| GPU | Typical units/hour | Role |
-| --- | --- | --- |
-| **A100 40GB** | **~5–7** | **Primary** — more hours per credit → more tokens |
-| A100 80GB | ~10–15 | **Avoid for token-max** — fewer hours for the same 300 credits |
-| L4 / weaker | varies | Accept only if A100 40GB unavailable; expect lower tok/s |
+### Hardware
+| GPU | Role |
+| --- | --- |
+| **A100 80GB** | **Primary** for 7B (batch ~110; wall-clock stop 11.5h) |
+| A100 40GB | Fallback with lower batch (~8–12) |
 
-Assume ~**300 Colab credits** → roughly **~43–60 h** on 40GB before waste; plan **~35–50 useful train hours** after setup/disconnects.
-
-### Colab ~12 h session limit — resume is mandatory
-Colab sessions can end around **~12 hours**. Phase 1 **must** be multi-session:
-
+### Resume (mandatory; ~12 h Colab sessions)
 | Requirement | Policy |
 | --- | --- |
-| Checkpoint frequency | At least every **30–60 minutes** wall time **and** every **N steps** (e.g. 200–500) |
-| What to save | LoRA adapter weights + optimizer state + **trainer state** (global step, tokens_seen, epoch, data cursor / sample offset, RNG, best val) |
-| Where to save | **Hugging Face Hub** private repo and/or Google Drive — **not** only `/content` (ephemeral) |
-| `LATEST` pointer | File or Hub revision tag pointing at the newest good ckpt |
-| Resume | On session start: load `LATEST` → continue until token target or credits run out |
-| Preemption / disconnect | Treat as normal; never rely on a single 12 h run finishing 5B |
-| End-of-session | Push a final ckpt **before** expected cutoff (~11 h mark) |
-
-### Anti-waste (keep GPU busy)
-- Cache model + tokenizer on Drive/Hub after first download.
-- Prefer streaming Hub dataset with resilient resume cursor over re-downloading the full 60 GB each session.
-- Avoid huge blocking Hub uploads every step; periodic adapter-only pushes are enough.
-- Log tok/s, tokens_seen, and ETA each session.
-
-### Overflow compute (optional later)
-If Colab cannot reach ~5B: continue the **same LoRA run** on CloudRift 4090 / GCP using the same Hub checkpoints (same resume format).
+| Checkpoint | Every **30 min** wall + every **N** steps |
+| What to save | LoRA adapters + trainer state + `phase1_state.json` (`tokens_seen`, step, tok/s) |
+| Where | Hub private repo and/or Drive — not only `/content` |
+| `LATEST` | Pointer to newest good ckpt |
+| Resume | Drive `LATEST` → local `LATEST` → newest `checkpoint-*` |
 
 ### Train stack pins (LOCKED)
 | Layer | Choice |
 | --- | --- |
-| Trainer stack | **Unsloth** `FastLanguageModel` + TRL `SFTTrainer` / `SFTConfig` |
-| Transformers | **≥4.51** (Qwen2.5 / Unsloth; v5 also fine) |
-| Model load | BF16 / `load_in_16bit=True`; **`load_in_4bit=False`** |
-| QLoRA | **Rejected** for Phase 1 (quality / Unsloth guidance) |
-| Entry script | [`train_phase1.py`](train_phase1.py) + [`phase1_colab.ipynb`](phase1_colab.ipynb) |
-
-### Still TBD (later sections)
-- Phase 2 SFT schema and sources
-- Orin export / quant path
-- Eval suite beyond val loss + smoke completions
+| Trainer | Unsloth **`FastLanguageModel`** + TRL `SFTTrainer` / `SFTConfig` |
+| Install | Unsloth Colab `--no-deps` + matching `xformers` for torch minor |
+| Download | `UNSLOTH_STABLE_DOWNLOADS=1`, `UNSLOTH_DISABLE_STATISTICS=1`, `HF_HUB_DISABLE_XET=1`, HF `snapshot_download` → local_dir |
+| Model load | BF16; **`load_in_4bit=False`** |
+| QLoRA | **Rejected** for Phase 1 |
+| Entry | Sole Colab: [`qwen25_coder_7b_phase1_cpt_colab.ipynb`](qwen25_coder_7b_phase1_cpt_colab.ipynb) |
 
 ### Status
-**LOCKED** — 2026-07-12.
+**LOCKED** — 2026-07-14.
 
 ---
 
@@ -217,13 +158,10 @@ If Colab cannot reach ~5B: continue the **same LoRA run** on CloudRift 4090 / GC
 
 | Date | Topic | Decision |
 | --- | --- | --- |
-| 2026-07-12 | Base model | `Qwen/Qwen3.5-4B-Base`; instruct rejected as CPT start; Qwen2.5-Coder-3B as deploy fallback — **superseded 2026-07-13** |
-| 2026-07-12 | Corpus / roadmap | 60 GB as source pool; security / issue-PR / curated-repo → Phase 1.5 and/or 2 after Phase 1 results |
-| 2026-07-12 | Phase 1 method (v1) | Full FT CPT, 1 epoch — **superseded same day** |
-| 2026-07-12 | Phase 1 method (v2) | **LoRA** CPT, seq **2K–4K**, Unsloth-class stack, target **~5B tokens** on Colab; full FT deferred |
-| 2026-07-12 | Colab hardware / resume | Prefer **A100 40GB**; avoid 80GB for token-max; **mandatory multi-session resume** (≤~12 h sessions) via Hub/Drive ckpts |
-| 2026-07-12 | Train stack | Unsloth + TRL packing CPT; **no QLoRA**; see `train_phase1.py` |
-| 2026-07-13 | Packing / throughput | Attempted Qwen3.5 vision strip; Unsloth still skipped packing → fatal guard |
-| 2026-07-13 | Base model (v2) | Switch to **`Qwen3-4B-Base`**; FA2/xformers path; packing on; batch **48** |
-| 2026-07-14 | Model weights load | Revert to **Unsloth `FastLanguageModel.from_pretrained`**; purge incomplete Hub cache on one retry — still blocked on Qwen3-4B CDN |
-| 2026-07-14 | Base model (v3) | Switch to **`unsloth/Qwen2.5-Coder-3B`** (Coder base, packing OK, reliable Unsloth mirror) |
+| 2026-07-12 | Base model | `Qwen/Qwen3.5-4B-Base` — **superseded** |
+| 2026-07-12 | Corpus / roadmap | 60 GB source; ~5B Colab token target; multi-session Hub/Drive resume |
+| 2026-07-12 | Phase 1 method | **LoRA** CPT, seq 2K–4K, Unsloth-class, no QLoRA |
+| 2026-07-13 | Base model (v2) | `Qwen3-4B-Base` — **superseded** (CDN incomplete cache) |
+| 2026-07-14 | Base model (v3) | `Qwen2.5-Coder-3B` — **superseded** |
+| 2026-07-14 | Base model (v4) | `unsloth/gemma-4-E4B` — **superseded** (VLM packing skip) |
+| 2026-07-14 | Base model (v5) | **`unsloth/Qwen2.5-Coder-7B` Base**; BF16 LoRA; packing-required; `FastLanguageModel` Colab notebook |
