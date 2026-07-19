@@ -3,9 +3,10 @@
 Living document for fine-tuning choices.
 Goal: specialize a strong open **text-only** coder (~7B) for coding/security automation and PR review, deployable on Jetson Orin Nano 8GB and/or a small cloud machine.
 
-Corpus (Phase 1): `Aniket200325/coder-pretrain-60gb` (~59 GB raw text; Phase 1 trains a **~5B-token** stratified/streaming slice under Colab budget, not necessarily a full epoch).  
-Phase 1.5 (optional): security / curated-repo CPT if Phase 1 under-delivers.  
-Phase 2: instruction / PR-review SFT (security + issue/PR data preferred here by default).
+Corpus (Phase 1): `Aniket200325/coder-pretrain-60gb` (~59 GB raw text).  
+**Phase 1 cutover (2026-07):** stop CPT near **~400M tokens** (product pivot to SFT; further CPT only if SFT under-delivers).  
+Phase 1.5 (optional): security / curated-repo CPT if Phase 2 under-delivers.  
+Phase 2: instruction / PR-review **QLoRA SFT** on a **merged CPT domain base** (security + issue/PR data preferred).
 
 Scratch (from-scratch) work lives in [`../scratch/`](../scratch/). This folder is the fine-tune path.
 
@@ -79,11 +80,12 @@ Approximate mix (finalized): code ~30 GB, FineWeb-Edu ~15 GB, docs ~10 GB, math 
 | Tokens / full epoch (tokenizer-dependent) | **~15–25B** |
 | **Phase 1 compute target (Colab-first)** | **~5B tokens** stretch goal |
 | Floor if throughput is weak | **~2–3B tokens** still counts as a useful CPT pass |
+| **Actual Phase 1 cutover (Colab credits / product)** | **~400M tokens** — then Phase 2 SFT; optional more CPT later |
 
 Measure real **tok/s** in the first Colab hour and re-forecast: `tokens ≈ tok/s × 3600 × remaining_hours`.
 
 ### Status
-**LOCKED** — 2026-07-12.
+**LOCKED** — 2026-07-12; **cutover revised** 2026-07-19 (~400M → SFT).
 
 ---
 
@@ -154,6 +156,63 @@ Measure real **tok/s** in the first Colab hour and re-forecast: `tokens ≈ tok/
 
 ---
 
+## 5. Phase 1 → Phase 2 handoff (DECIDED)
+
+### CPT cutover
+| Item | Choice |
+| --- | --- |
+| Stop near | **~400M** tokens (current final CPT session targets this) |
+| Keep on Drive/Hub | Last good **`checkpoint-*`** (trainer resume) **and** adapter **`final/`** |
+| Do **not** use `final/` as `trainer.train(resume_from_checkpoint=...)` | Adapter-only; use `checkpoint-*` for CPT resume |
+| Optional more CPT | Only if Phase 2 SFT under-delivers on code fluency (Phase 1.5) |
+
+### Merge before SFT (**required**)
+| Item | Choice |
+| --- | --- |
+| Pattern | **Merge CPT LoRA into Base**, then train a **fresh** SFT adapter |
+| Base | `unsloth/Qwen2.5-Coder-7B` |
+| Adapter source | Drive `…/coder-qwen25-coder-7b-phase1-lora/final` (or equivalent Hub adapters) |
+| Output | Merged **BF16** domain base (Drive + optional private Hub) |
+| Script | [`merge_cpt_lora_colab.py`](merge_cpt_lora_colab.py) (Colab) |
+| Do **not** | Continue the same CPT LoRA into SFT as the default path |
+
+### Status
+**LOCKED** — 2026-07-19.
+
+---
+
+## 6. Phase 2 SFT method (DECIDED — recipe; data mix TBD)
+
+### Choice
+- **Init:** merged CPT domain base (not stock Instruct as the main line).
+- **Method:** **fresh QLoRA** SFT (`load_in_4bit=True`) for Colab cost / VRAM headroom. BF16 LoRA allowed as a later quality A/B.
+- **Task:** instruction / PR-review / security automation (chat-formatted).
+- **Template:** Qwen2.5 chat template **on** (unlike Phase 1).
+- **Loss:** prefer assistant-only / completion masking (not full-token CPT loss).
+- **Stock Instruct:** reserved for optional baseline compare, not the primary Phase 2 start.
+
+### SFT knobs (defaults — finalize with SFT notebook)
+| Knob | Value | Notes |
+| --- | --- | --- |
+| Precision | **QLoRA 4-bit** | Fresh adapters; do not reuse CPT adapter weights |
+| LoRA `r` / alpha | **32 / 64** start | Raise to 64/128 if underfitting |
+| LR | **~2e-5** | Lower than CPT `1e-4` |
+| Seq | **2048** default; trial **4096** if diffs need it | Measure VRAM |
+| Packing | Prefer on if Unsloth/TRL allows for text Causal LM | Abort/smoke-check |
+| Data | PR/review-heavy + security + light code instruct | Exact mix **TBD** (next decision) |
+
+### Explicitly deferred
+| Item | Status |
+| --- | --- |
+| Exact SFT datasets / mix ratios | **TBD** after merge script is validated |
+| SFT Colab notebook | **TBD** (after data + knobs locked) |
+| Jetson quant export of SFT adapters | After Phase 2 train |
+
+### Status
+**LOCKED** (method) — 2026-07-19; **data + notebook open**.
+
+---
+
 ## Decision log
 
 | Date | Topic | Decision |
@@ -165,3 +224,5 @@ Measure real **tok/s** in the first Colab hour and re-forecast: `tokens ≈ tok/
 | 2026-07-14 | Base model (v3) | `Qwen2.5-Coder-3B` — **superseded** |
 | 2026-07-14 | Base model (v4) | `unsloth/gemma-4-E4B` — **superseded** (VLM packing skip) |
 | 2026-07-14 | Base model (v5) | **`unsloth/Qwen2.5-Coder-7B` Base**; BF16 LoRA; packing-required; `FastLanguageModel` Colab notebook |
+| 2026-07-19 | Phase 1 cutover | Stop CPT near **~400M tokens**; pivot to SFT |
+| 2026-07-19 | Phase 2 init | **Merge CPT LoRA → domain base**; **fresh QLoRA** for SFT (not continue CPT adapters) |
