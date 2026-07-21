@@ -6,7 +6,7 @@ Goal: specialize a strong open **text-only** coder (~7B) for coding/security aut
 Corpus (Phase 1): `Aniket200325/coder-pretrain-60gb` (~59 GB raw text).  
 **Phase 1 cutover (2026-07):** stop CPT near **~400M tokens** (product pivot to SFT; further CPT only if SFT under-delivers).  
 Phase 1.5 (optional): security / curated-repo CPT if Phase 2 under-delivers.  
-Phase 2: instruction / PR-review **QLoRA SFT** on a **merged CPT domain base** (security + issue/PR data preferred).
+Phase 2: instruction / PR-review / patch / implement **QLoRA SFT** on a **merged CPT domain base** (~140K mix; see §7).
 
 Scratch (from-scratch) work lives in [`../scratch/`](../scratch/). This folder is the fine-tune path.
 
@@ -172,44 +172,155 @@ Measure real **tok/s** in the first Colab hour and re-forecast: `tokens ≈ tok/
 | Pattern | **Merge CPT LoRA into Base**, then train a **fresh** SFT adapter |
 | Base | `unsloth/Qwen2.5-Coder-7B` |
 | Adapter source | Drive `…/coder-qwen25-coder-7b-phase1-lora/final` (or equivalent Hub adapters) |
-| Output | Merged **BF16** domain base (Drive + optional private Hub) |
+| Output (Drive) | `/content/drive/MyDrive/coder-qwen25-coder-7b-cpt-merged` |
+| Output (Hub) | Private **`Aniket200325/coder-qwen25-coder-7b-cpt-merged`** |
 | Script | [`merge_cpt_lora_colab.py`](merge_cpt_lora_colab.py) (Colab) |
 | Do **not** | Continue the same CPT LoRA into SFT as the default path |
 
 ### Status
-**LOCKED** — 2026-07-19.
+**LOCKED** — 2026-07-19; Hub id locked 2026-07-20.
 
 ---
 
-## 6. Phase 2 SFT method (DECIDED — recipe; data mix TBD)
+## 6. Phase 2 SFT method (DECIDED)
 
 ### Choice
-- **Init:** merged CPT domain base (not stock Instruct as the main line).
+- **Init:** merged CPT domain base **`Aniket200325/coder-qwen25-coder-7b-cpt-merged`** (Drive mirror OK). Not stock Instruct as the main line.
 - **Method:** **fresh QLoRA** SFT (`load_in_4bit=True`) for Colab cost / VRAM headroom. BF16 LoRA allowed as a later quality A/B.
-- **Task:** instruction / PR-review / security automation (chat-formatted).
-- **Template:** Qwen2.5 chat template **on** (unlike Phase 1).
-- **Loss:** prefer assistant-only / completion masking (not full-token CPT loss).
+- **Product tasks:** (1) GitHub / PR **review**, (2) **patch** from review feedback, (3) **implement** code from instructions — needs both reasoning and coding ability.
+- **Template:** Qwen2.5 chat template **on** (unlike Phase 1). Attach Instruct **ChatML** tokenizer/template only — not Instruct weights.
+- **Loss:** assistant-only / completion masking via Unsloth `train_on_responses_only` (Qwen markers `<|im_start|>user\n` / `<|im_start|>assistant\n`).
 - **Stock Instruct:** reserved for optional baseline compare, not the primary Phase 2 start.
+- **Entry:** Colab **notebook** (same style as Phase 1 CPT notebook) — not a standalone train script as the primary path.
 
-### SFT knobs (defaults — finalize with SFT notebook)
+### SFT knobs (LOCKED — 2026-07-20)
 | Knob | Value | Notes |
 | --- | --- | --- |
 | Precision | **QLoRA 4-bit** | Fresh adapters; do not reuse CPT adapter weights |
 | LoRA `r` / alpha | **32 / 64** start | Raise to 64/128 if underfitting |
-| LR | **~2e-5** | Lower than CPT `1e-4` |
-| Seq | **2048** default; trial **4096** if diffs need it | Measure VRAM |
-| Packing | Prefer on if Unsloth/TRL allows for text Causal LM | Abort/smoke-check |
-| Data | PR/review-heavy + security + light code instruct | Exact mix **TBD** (next decision) |
+| LR | **~2e-5** | Lower than CPT `1e-4`; cosine + short warmup |
+| Seq | **2048** default; trial **4096** if diffs need it | Mix already filtered at 2048 |
+| Packing | **Off** (`packing=False`) | Chat + `train_on_responses_only` is fragile with packing (mask bugs / cross-sample bleed). Throughput via batch + grad accum instead. Unlike Phase 1 (packing required) |
+| Batch (smoke → tune) | `per_device_train_batch_size` **4–8** | Fine-tune after smoke VRAM/tok/s |
+| Grad accum | Effective batch **~32–64** | e.g. batch 4 × accum 8–16, or batch 8 × accum 4–8 |
+| Epochs | **1–2** start (prefer 1 first) | Watch train/eval loss |
+| Data | Hub `Aniket200325/coder-sft-mix-v1` (`train`) | See **§7**; ~136K after cleanup |
+| Eval set | `eval_securecodepairs` split | Tiny / security-only — early signal, not sole quality gate |
+| Eval cadence | **Every N steps** (not only end-of-epoch) | Catch bad LR/batch/masking early and retune |
+| Smoke gate | Labels not all `-100`; packing confirmed **off**; one generate with `add_generation_prompt=True` | Before full run |
 
 ### Explicitly deferred
 | Item | Status |
 | --- | --- |
-| Exact SFT datasets / mix ratios | **TBD** after merge script is validated |
-| SFT Colab notebook | **TBD** (after data + knobs locked) |
+| SFT Colab **training** notebook | **TBD** (knobs locked; implement next) |
+| Exact `eval_steps` / `save_steps` / N | Set in notebook from smoke wall-clock |
+| SFT adapter Hub publish id | Choose when notebook lands (Drive checkpoints required regardless) |
 | Jetson quant export of SFT adapters | After Phase 2 train |
 
 ### Status
-**LOCKED** (method) — 2026-07-19; **data + notebook open**.
+**LOCKED** (method + train knobs) — 2026-07-20; **data mix + preprocess locked** — 2026-07-20 (§7); training notebook still open.
+
+---
+
+## 7. Phase 2 SFT datasets & preprocessing (DECIDED)
+
+### Product framing (drives every choice below)
+The model must: **review** GitHub diffs, **patch** code from review feedback, and **implement** new code. So the mix balances (a) general coding instruct, (b) review↔fix pairs from real PRs, (c) security reasoning + secure rewrites. Prefer sources that already contain natural reasoning in the assistant turn; do **not** invent fake CoT tags.
+
+### Script & publish
+| Item | Choice |
+| --- | --- |
+| Script | [`preprocess_sft_mix_colab.py`](preprocess_sft_mix_colab.py) (Colab) |
+| Runtime | Colab; full `load_dataset` download (not streaming) |
+| Drive out | `/content/drive/MyDrive/coder-sft-mix-v1/` → `sft_mix_v1.parquet`, `sft_eval_securecodepairs.parquet`, `manifest.json`, `samples.jsonl` |
+| Hub | Private dataset `--hub_dataset_id` with splits `train` + `eval_securecodepairs` (required unless `--skip_hub` for smoke) |
+| Length-filter tokenizer | **`Qwen/Qwen2.5-Coder-7B-Instruct` tokenizer only** (ChatML). **Not** Instruct model weights — Phase-2 weights stay Base → CPT-merge → SFT |
+
+### Mix (target ~140K rows)
+| Bucket | Source | Count | Share | Role |
+| --- | --- | --- | --- | --- |
+| **A. Code instruct** | [`nvidia/OpenCodeInstruct`](https://huggingface.co/datasets/nvidia/OpenCodeInstruct) | **75K** (sampled) | ~53% | Implement / write code; chat format + coding ability |
+| **B. Review / patch** | [`ronantakizawa/github-codereview`](https://huggingface.co/datasets/ronantakizawa/github-codereview) | **50K** (sampled) | ~36% | PR review comments + apply patches |
+| **C. Security** | `cve-sft-v5` + `SecureCodePairs` + CyberNative DPO | **~15.1K** (all usable) | ~11% | Vuln explain / remediate / secure rewrite |
+| | [`auren-research/cve-sft-v5`](https://huggingface.co/datasets/auren-research/cve-sft-v5) | **10,000** | | Structured CVE reasoning |
+| | [`ismailtasdelen/SecureCodePairs`](https://huggingface.co/datasets/ismailtasdelen/SecureCodePairs) | **~470** code (train split; **2** variants) | | High-trust vuln↔secure pairs |
+| | [`CyberNative/Code_Vulnerability_Security_DPO`](https://huggingface.co/datasets/CyberNative/Code_Vulnerability_Security_DPO) | **4,656** | | Extra secure-rewrite volume (`chosen` only) |
+
+Do **not** pad to an arbitrary 150K with lower-quality rows after cleanup. Hold out SecureCodePairs `validation` / `test` / `benchmark` for eval (not SFT).
+
+### Design locks (product-aligned)
+
+| Decision | Choice | Why |
+| --- | --- | --- |
+| Review task split (within positives) | **~70% `code_review`** (diff → comment) · **~30% `code_review_fix`** (before + comment → after); no row duplicated into both | Primary product is review; patching is second skill |
+| Negatives in review bucket | **~15%** of the 50K (`No issues found.`) | Teaches when *not* to nitpick |
+| Review quality filter | Try `quality_score >= 0.75` first; fall back to **0.6** if pool too small; drop empty fields; positives `comment_type != "none"` | Signal over volume |
+| Review upsample | 2× weight on `bug` / `security` / `performance` vs other types | Matches reviewer usefulness |
+| OpenCodeInstruct sample | Cascade `average_test_score >= 0.8` → `>= 0.5` → rest; ~50/50 `generic`/`algorithmic`; fixed-seed → 75K | Verified-ish solutions |
+| System prompts | **One family per `task`** (exact strings below) | Consistent inference behavior |
+| Reasoning style | Source-native structure only; **no** synthetic `<think>` wrappers | Avoid fake CoT |
+| CyberNative use | `question` → `chosen` only; drop empty / identical-to-`rejected` | Breadth only, not security oracle |
+| SecureCodePairs | Train only for mix; **2** variants (review + rewrite); hold out val/test/benchmark | High trust, tiny |
+| Target schema | Conversational `messages`; **do not** pre-render ChatML | TRL/Unsloth + assistant-only loss |
+| Min length | user ≥ **32** chars; assistant ≥ **16** (accept-phrase negatives exempt) | Drop junk |
+| Seq filter | Drop if ChatML token length `> max_seq_length` (default **2048**); prefer drop over truncate | Clean gradients |
+| Dedup | MD5 of normalized user+assistant; keep first | Cross-source dupes |
+
+### Exact system prompts (locked in script)
+| `task` | System string |
+| --- | --- |
+| `code_instruct` | `You are a helpful coding assistant. Implement correct, clear solutions.` |
+| `code_review` | `You are a senior GitHub code reviewer. Find bugs, risks, and security issues. Be concise. If the code is fine, say so.` |
+| `code_review_fix` | `You apply GitHub review feedback and produce the corrected code.` |
+| `security` | `You are a defensive security assistant. Explain the weakness and provide a secure fix or remediation.` |
+
+### Canonical row schema
+```json
+{
+  "messages": [
+    {"role": "system", "content": "<task system>"},
+    {"role": "user", "content": "<prompt>"},
+    {"role": "assistant", "content": "<target>"}
+  ],
+  "source": "opencodeinstruct|github-codereview|cve-sft-v5|securecodepairs|cybernative-dpo",
+  "task": "code_instruct|code_review|code_review_fix|security"
+}
+```
+
+### Per-source mapping (preprocess)
+
+**A. OpenCodeInstruct → `code_instruct`**
+- `user` = `input`; `assistant` = `output`.
+
+**B. github-codereview**
+- **`code_review`:** user = language + file path + fenced `diff_context` (+ optional `before_code`); assistant = `reviewer_comment` or `No issues found.` for negatives.
+- **`code_review_fix`:** user = `before_code` + reviewer comment; assistant = `after_code` only.
+
+**C. Security → `security`**
+- **CVE-SFT:** CVE metadata instruction → structured markdown (plain explanation, deep dive, attack scenario, remediation, code example).
+- **SecureCodePairs:** (1) review vuln → root_cause/attack/fix + secure_code; (2) rewrite securely → secure_code + short fix.
+- **CyberNative:** `question` → `chosen`.
+
+### Global cleanup order
+1. Sanitize (NUL strip, newline normalize, trim); drop empty user/assistant.
+2. Min-length filter.
+3. Dedup.
+4. ChatML seq filter via Instruct tokenizer.
+5. Fixed-seed shuffle; write Drive artifacts + Hub push.
+
+### Explicitly rejected (v1 SFT data)
+| Option | Reason |
+| --- | --- |
+| Full OpenCodeInstruct 5M | Overkill after CPT; dilutes review/security |
+| Agentic SWE trajectory dumps as main mix | Scaffold-specific; defer until tool format is fixed |
+| Pre-baked ChatML strings as the dataset | Breaks TRL masking / template portability |
+| Invented CoT tags on all rows | Fake reasoning; prefer source-native structure |
+| Training on SecureCodePairs benchmark split | Keep for eval |
+| Treating CyberNative as high-trust security label | Community quality concerns on `chosen` |
+| Merging Instruct **weights** with CPT LoRA | Different base; LoRA is Base-relative — template/tokenizer only |
+
+### Status
+**LOCKED** — 2026-07-20 (script added same day).
 
 ---
 
@@ -226,3 +337,9 @@ Measure real **tok/s** in the first Colab hour and re-forecast: `tokens ≈ tok/
 | 2026-07-14 | Base model (v5) | **`unsloth/Qwen2.5-Coder-7B` Base**; BF16 LoRA; packing-required; `FastLanguageModel` Colab notebook |
 | 2026-07-19 | Phase 1 cutover | Stop CPT near **~400M tokens**; pivot to SFT |
 | 2026-07-19 | Phase 2 init | **Merge CPT LoRA → domain base**; **fresh QLoRA** for SFT (not continue CPT adapters) |
+| 2026-07-20 | Phase 2 data mix | ~140K: OpenCodeInstruct 75K + github-codereview 50K + security ~15.1K (CVE + SecureCodePairs + CyberNative) |
+| 2026-07-20 | Phase 2 preprocess | Conversational `messages`; 70/30 review vs fix; 15% review negatives; task-level systems; source-native reasoning; no fake CoT |
+| 2026-07-20 | Preprocess script | [`preprocess_sft_mix_colab.py`](preprocess_sft_mix_colab.py); Drive + private Hub; Instruct tokenizer for length filter only |
+| 2026-07-20 | Phase 2 train form | Colab **notebook** like Phase 1 |
+| 2026-07-20 | Phase 2 train knobs | QLoRA; batch 4–8 + effective ~32–64; eval every N steps; init `Aniket200325/coder-qwen25-coder-7b-cpt-merged` |
+| 2026-07-20 | Phase 2 packing | **Off** for SFT (chat + assistant-only loss); unlike Phase 1 CPT |
