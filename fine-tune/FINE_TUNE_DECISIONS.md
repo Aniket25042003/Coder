@@ -191,9 +191,12 @@ Measure real **tok/s** in the first Colab hour and re-forecast: `tokens ≈ tok/
 - **Template:** Qwen2.5 chat template **on** (unlike Phase 1). Attach Instruct **ChatML** tokenizer/template only — not Instruct weights.
 - **Loss:** assistant-only / completion masking via Unsloth `train_on_responses_only` (Qwen markers `<|im_start|>user\n` / `<|im_start|>assistant\n`).
 - **Stock Instruct:** reserved for optional baseline compare, not the primary Phase 2 start.
-- **Entry:** Colab **notebook** (same style as Phase 1 CPT notebook) — not a standalone train script as the primary path.
+- **Entry:** Colab **notebook** [`qwen25_coder_7b_phase2_sft_colab.ipynb`](qwen25_coder_7b_phase2_sft_colab.ipynb) (same style as Phase 1 CPT notebook) — not a standalone train script as the primary path.
+- **Adapter Hub:** **`Aniket200325/coder-qwen25-coder-7b-sft-qlora-v1`** (private). Drive checkpoints required regardless.
+- **Checkpoints / resume:** **60 min** wall-clock timed saves (`CKPT_MINUTES=60` full; smoke `5`) → mirror to Drive + write `LATEST` on `checkpoint-*` (not `final/`); `RESUME="auto"` for full runs (Phase 1 pattern).
+- **Final merge:** optional **Cell 22** only after the last train session (`RUN_FINAL_MERGE=False` by default) → Drive/Hub SFT-merged BF16.
 
-### SFT knobs (LOCKED — 2026-07-20)
+### SFT knobs (LOCKED — 2026-07-20; notebook defaults 2026-07-21)
 | Knob | Value | Notes |
 | --- | --- | --- |
 | Precision | **QLoRA 4-bit** | Fresh adapters; do not reuse CPT adapter weights |
@@ -201,24 +204,25 @@ Measure real **tok/s** in the first Colab hour and re-forecast: `tokens ≈ tok/
 | LR | **~2e-5** | Lower than CPT `1e-4`; cosine + short warmup |
 | Seq | **2048** default; trial **4096** if diffs need it | Mix already filtered at 2048 |
 | Packing | **Off** (`packing=False`) | Chat + `train_on_responses_only` is fragile with packing (mask bugs / cross-sample bleed). Throughput via batch + grad accum instead. Unlike Phase 1 (packing required) |
-| Batch (smoke → tune) | `per_device_train_batch_size` **4–8** | Fine-tune after smoke VRAM/tok/s |
-| Grad accum | Effective batch **~32–64** | e.g. batch 4 × accum 8–16, or batch 8 × accum 4–8 |
-| Epochs | **1–2** start (prefer 1 first) | Watch train/eval loss |
+| Batch (smoke → tune) | smoke `2`; full start **`4`** (tune toward 4–8) | Fine-tune after smoke VRAM/tok/s |
+| Grad accum | smoke `4`; full start **`8`** (effective **32**) | Target effective batch ~32–64 |
+| Epochs | smoke `MAX_STEPS=30`; full **1** epoch first | Watch train/eval loss |
 | Data | Hub `Aniket200325/coder-sft-mix-v1` (`train`) | See **§7**; ~136K after cleanup |
 | Eval set | `eval_securecodepairs` split | Tiny / security-only — early signal, not sole quality gate |
-| Eval cadence | **Every N steps** (not only end-of-epoch) | Catch bad LR/batch/masking early and retune |
+| Eval / step-save | smoke every **10** / **15**; full every **200** / **500** steps | Plus timed Drive ckpt every **60 min** |
 | Smoke gate | Labels not all `-100`; packing confirmed **off**; one generate with `add_generation_prompt=True` | Before full run |
 
 ### Explicitly deferred
 | Item | Status |
 | --- | --- |
-| SFT Colab **training** notebook | **TBD** (knobs locked; implement next) |
-| Exact `eval_steps` / `save_steps` / N | Set in notebook from smoke wall-clock |
-| SFT adapter Hub publish id | Choose when notebook lands (Drive checkpoints required regardless) |
+| SFT Colab **training** notebook | **Done** — [`qwen25_coder_7b_phase2_sft_colab.ipynb`](qwen25_coder_7b_phase2_sft_colab.ipynb) |
+| Exact `eval_steps` / `save_steps` / N | **Locked in notebook:** full `EVAL_STEPS=200`, `SAVE_STEPS=500`; timed `CKPT_MINUTES=60` |
+| SFT adapter Hub publish id | **`Aniket200325/coder-qwen25-coder-7b-sft-qlora-v1`** |
+| Optional final SFT→BF16 merge | Notebook **Cell 22** (`RUN_FINAL_MERGE`); Drive `coder-qwen25-coder-7b-sft-merged` |
 | Jetson quant export of SFT adapters | After Phase 2 train |
 
 ### Status
-**LOCKED** (method + train knobs) — 2026-07-20; **data mix + preprocess locked** — 2026-07-20 (§7); training notebook still open.
+**LOCKED** (method + train knobs) — 2026-07-20; **data mix + preprocess locked** — 2026-07-20 (§7); **training notebook + adapter Hub id + 1h ckpt/auto-resume locked** — 2026-07-21.
 
 ---
 
@@ -343,3 +347,4 @@ Do **not** pad to an arbitrary 150K with lower-quality rows after cleanup. Hold 
 | 2026-07-20 | Phase 2 train form | Colab **notebook** like Phase 1 |
 | 2026-07-20 | Phase 2 train knobs | QLoRA; batch 4–8 + effective ~32–64; eval every N steps; init `Aniket200325/coder-qwen25-coder-7b-cpt-merged` |
 | 2026-07-20 | Phase 2 packing | **Off** for SFT (chat + assistant-only loss); unlike Phase 1 CPT |
+| 2026-07-21 | Phase 2 notebook | [`qwen25_coder_7b_phase2_sft_colab.ipynb`](qwen25_coder_7b_phase2_sft_colab.ipynb); Hub adapter `…/coder-qwen25-coder-7b-sft-qlora-v1`; **60 min** Drive ckpt + `RESUME=auto`; optional Cell 22 final BF16 merge |
