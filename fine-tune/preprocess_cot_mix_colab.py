@@ -160,19 +160,20 @@ def _resolve_token(cli_token: str) -> str:
     return token
 
 
-def _maybe_mount_drive(out_dir: Path) -> None:
+def _maybe_mount_drive(out_dir: Path) -> Path:
     if "/content/drive" not in str(out_dir):
-        return
+        return out_dir
     if Path("/content/drive/MyDrive").is_dir():
         print("Drive already mounted.", flush=True)
-        return
+        return out_dir
     try:
         from google.colab import drive  # type: ignore
         drive.mount("/content/drive")
+        return out_dir
     except Exception as e:
-        raise SystemExit(
-            f"Need Google Drive for paths under /content/drive but mount failed: {e}"
-        )
+        fallback = Path("/kaggle/working/coder-reasoning-cot-v1" if Path("/kaggle/working").is_dir() else "./coder-reasoning-cot-v1").resolve()
+        print(f"Notice: Google Drive unavailable ({e}). Using local fallback output dir: {fallback}", flush=True)
+        return fallback
 
 
 def _sanitize_text(text: Any) -> str:
@@ -793,7 +794,7 @@ def main() -> None:
         if not token:
             raise SystemExit("HF token required for Hub push (or pass --skip_hub)")
 
-    _maybe_mount_drive(out_dir)
+    out_dir = _maybe_mount_drive(out_dir)
     if (
         not args.push_only
         and out_dir.exists()
