@@ -52,9 +52,9 @@ from trl import SFTConfig, SFTTrainer
 def parse_args():
     p = argparse.ArgumentParser(description="Phase 3 CoT Fine-Tuning")
     p.add_argument("--smoke", action="store_true", help="Run 30-step smoke test")
-    p.add_argument("--batch", type=int, default=10, help="Per-device train batch size")
-    p.add_argument("--accum", type=int, default=6, help="Gradient accumulation steps")
-    p.add_argument("--lr", type=float, default=2.5e-5, help="Learning rate")
+    p.add_argument("--batch", type=int, default=4, help="Per-device train batch size")
+    p.add_argument("--accum", type=int, default=8, help="Gradient accumulation steps")
+    p.add_argument("--lr", type=float, default=1.5e-5, help="Learning rate")
     p.add_argument("--epochs", type=int, default=2, help="Number of train epochs")
     p.add_argument("--max_seq_len", type=int, default=4096, help="Max sequence length")
     p.add_argument("--resume", type=str, default="auto", help="Resume mode: auto, none, or path")
