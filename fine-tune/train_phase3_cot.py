@@ -58,7 +58,7 @@ def parse_args():
     p.add_argument("--epochs", type=int, default=1, help="Number of train epochs")
     p.add_argument("--max_seq_len", type=int, default=4096, help="Max sequence length")
     p.add_argument("--resume", type=str, default="auto", help="Resume mode: auto, none, or path")
-    p.add_argument("--model_hub", type=str, default="Aniket200325/coder-qwen25-coder-7b-sft-merged")
+    p.add_argument("--model_hub", type=str, default="Aniket200325/coder-qwen25-coder-7b-sft-qlora-v1-merged")
     p.add_argument("--dataset_id", type=str, default="Aniket200325/coder-reasoning-cot-v1")
     p.add_argument("--hub_adapter_id", type=str, default="Aniket200325/coder-qwen25-coder-7b-cot-qlora-v1")
     p.add_argument("--hf_token", type=str, default="", help="Hugging Face API token")
@@ -118,6 +118,12 @@ def main():
         )
 
     if world_size > 1 and torch.cuda.is_available():
+        if not torch.distributed.is_initialized():
+            torch.distributed.init_process_group(
+                backend="nccl" if torch.cuda.is_available() else "gloo",
+                init_method="env://",
+            )
+        torch.cuda.set_device(local_rank)
         torch.distributed.barrier()
 
     # Load Model & Tokenizer
