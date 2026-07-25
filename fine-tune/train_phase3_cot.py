@@ -258,14 +258,8 @@ def main():
             return SFTConfig(**kwargs)
         except TypeError:
             pass
-        if "eval_strategy" in kwargs:
-            kwargs["evaluation_strategy"] = kwargs.pop("eval_strategy")
-            try:
-                return SFTConfig(**kwargs)
-            except TypeError:
-                pass
-        if "max_seq_length" in kwargs:
-            kwargs["max_length"] = kwargs.pop("max_seq_length")
+        if "evaluation_strategy" in kwargs:
+            kwargs["eval_strategy"] = kwargs.pop("evaluation_strategy")
             try:
                 return SFTConfig(**kwargs)
             except TypeError:
@@ -273,6 +267,7 @@ def main():
         for k in (
             "packing", "logging_first_step",
             "max_length", "max_seq_length", "do_eval", "hub_private_repo",
+            "evaluation_strategy",
         ):
             kwargs.pop(k, None)
         return SFTConfig(**kwargs)
