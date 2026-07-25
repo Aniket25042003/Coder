@@ -210,10 +210,7 @@ def main():
             if ckpt.exists():
                 sync_checkpoint_fn(ckpt)
 
-    use_bf16 = torch.cuda.is_available() and torch.cuda.is_bf16_supported()
-    use_fp16 = torch.cuda.is_available() and not use_bf16
-
-    sft_args = SFTConfig(
+        sft_kwargs = dict(
         output_dir=str(out_dir),
         per_device_train_batch_size=args_cli.batch,
         gradient_accumulation_steps=args_cli.accum,
@@ -229,30 +226,80 @@ def main():
         seed=42,
         report_to="none",
         remove_unused_columns=False,
+        dataset_num_proc=2,
+        packing=False,
         dataset_text_field="text",
-        max_seq_length=args_cli.max_seq_len,
+        max_seq_length=None,
         eval_strategy="steps",
         eval_steps=10 if args_cli.smoke else 50,
+        load_best_model_at_end=False,
         do_eval=True,
-        max_steps=30 if args_cli.smoke else -1,
-        num_train_epochs=args_cli.epochs if not args_cli.smoke else 1,
-        ddp_find_unused_parameters=False if world_size > 1 else None,
     )
+    if args_cli.smoke:
+        sft_kwargs["max_steps"] = 30
+        sft_kwargs["warmup_steps"] = 5
+    else:
+        sft_kwargs["num_train_epochs"] = args_cli.epochs
+        sft_kwargs["warmup_ratio"] = 0.03
+        sft_kwargs["max_steps"] = -1
+
+    if world_size > 1:
+        sft_kwargs["ddp_find_unused_parameters"] = False
+
+    def build_sft_config(kwargs):
+        kwargs = dict(kwargs)
+        if not kwargs.get("packing", False):
+            kwargs["max_seq_length"] = None
+            kwargs["max_length"] = None
+        try:
+            return SFTConfig(**kwargs)
+        except TypeError:
+            pass
+        if "eval_strategy" in kwargs:
+            kwargs["evaluation_strategy"] = kwargs.pop("eval_strategy")
+            try:
+                return SFTConfig(**kwargs)
+            except TypeError:
+                pass
+        if "max_seq_length" in kwargs:
+            kwargs["max_length"] = kwargs.pop("max_seq_length")
+            try:
+                return SFTConfig(**kwargs)
+            except TypeError:
+                pass
+        for k in (
+            "packing", "logging_first_step",
+            "max_length", "max_seq_length", "do_eval", "hub_private_repo",
+        ):
+            kwargs.pop(k, None)
+        return SFTConfig(**kwargs)
+
+    args = build_sft_config(sft_kwargs)
+
+    _BaseSFTTrainer = SFTTrainer
+
+    class _NoPaddingFreeSFTTrainer(_BaseSFTTrainer):
+        @property
+        def padding_free(self):
+            return False
+        @padding_free.setter
+        def padding_free(self, value):
+            pass
 
     trainer_kwargs = dict(
         model=model,
-        args=sft_args,
+        args=args,
         train_dataset=train_ds,
         eval_dataset=eval_ds,
         processing_class=tokenizer,
         callbacks=[Phase3SyncCallback()],
     )
     try:
-        trainer = SFTTrainer(**trainer_kwargs)
+        trainer = _NoPaddingFreeSFTTrainer(**trainer_kwargs)
     except TypeError:
         trainer_kwargs.pop("processing_class", None)
         trainer_kwargs["tokenizer"] = tokenizer
-        trainer = SFTTrainer(**trainer_kwargs)
+        trainer = _NoPaddingFreeSFTTrainer(**trainer_kwargs)
 
     trainer = train_on_responses_only(
         trainer,
