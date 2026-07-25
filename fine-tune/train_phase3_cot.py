@@ -235,6 +235,7 @@ def main():
         max_seq_length=None,
         eval_strategy="steps",
         eval_steps=10 if args_cli.smoke else 50,
+        eval_accumulation_steps=2,
         load_best_model_at_end=False,
         do_eval=True,
     )
