@@ -204,13 +204,16 @@ def main():
             except Exception as e:
                 print(f"Notice: HF Hub sync failed for {src.name}: {e}", flush=True)
 
+    use_bf16 = torch.cuda.is_available() and torch.cuda.is_bf16_supported()
+    use_fp16 = torch.cuda.is_available() and not use_bf16
+
     class Phase3SyncCallback(TrainerCallback):
         def on_save(self, args, state, control, **kwargs):
             ckpt = Path(args.output_dir) / f"checkpoint-{state.global_step}"
             if ckpt.exists():
                 sync_checkpoint_fn(ckpt)
 
-        sft_kwargs = dict(
+    sft_kwargs = dict(
         output_dir=str(out_dir),
         per_device_train_batch_size=args_cli.batch,
         gradient_accumulation_steps=args_cli.accum,
