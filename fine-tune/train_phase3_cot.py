@@ -245,7 +245,6 @@ def main():
         train_dataset=train_ds,
         eval_dataset=eval_ds,
         processing_class=tokenizer,
-        dataset_text_field="text",
         callbacks=[Phase3SyncCallback()],
     )
     try:
