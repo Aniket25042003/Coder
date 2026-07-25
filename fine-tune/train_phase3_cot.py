@@ -55,7 +55,7 @@ def main():
     world_size = int(os.environ.get("WORLD_SIZE", "1"))
     is_main = local_rank == 0
 
-        hf_token = args_cli.hf_token or os.environ.get("HF_TOKEN") or os.environ.get("HUGGING_FACE_HUB_TOKEN") or ""
+    hf_token = args_cli.hf_token or os.environ.get("HF_TOKEN") or os.environ.get("HUGGING_FACE_HUB_TOKEN") or ""
     if not hf_token:
         try:
             from kaggle_secrets import UserSecretsClient
