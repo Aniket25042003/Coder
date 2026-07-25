@@ -45,6 +45,7 @@ def parse_args():
     p.add_argument("--model_hub", type=str, default="Aniket200325/coder-qwen25-coder-7b-sft-merged")
     p.add_argument("--dataset_id", type=str, default="Aniket200325/coder-reasoning-cot-v1")
     p.add_argument("--hub_adapter_id", type=str, default="Aniket200325/coder-qwen25-coder-7b-cot-qlora-v1")
+    p.add_argument("--hf_token", type=str, default="", help="Hugging Face API token")
     return p.parse_args()
 
 def main():
@@ -54,7 +55,13 @@ def main():
     world_size = int(os.environ.get("WORLD_SIZE", "1"))
     is_main = local_rank == 0
 
-    hf_token = os.environ.get("HF_TOKEN") or os.environ.get("HUGGING_FACE_HUB_TOKEN") or ""
+        hf_token = args_cli.hf_token or os.environ.get("HF_TOKEN") or os.environ.get("HUGGING_FACE_HUB_TOKEN") or ""
+    if not hf_token:
+        try:
+            from kaggle_secrets import UserSecretsClient
+            hf_token = UserSecretsClient().get_secret("HF_TOKEN") or ""
+        except Exception:
+            pass
     if not hf_token:
         try:
             from google.colab import userdata
