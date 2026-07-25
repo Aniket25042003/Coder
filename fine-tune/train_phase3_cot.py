@@ -172,8 +172,8 @@ def main():
             text = ""
         return {"text": text if isinstance(text, str) else ""}
 
-    train_ds = train_raw.map(to_text, num_proc=2 if len(train_raw) > 64 else 1)
-    eval_ds = eval_raw.map(to_text, num_proc=1)
+    train_ds = train_raw.map(to_text, num_proc=2 if len(train_raw) > 64 else 1, remove_columns=train_raw.column_names)
+    eval_ds = eval_raw.map(to_text, num_proc=1, remove_columns=eval_raw.column_names)
     train_ds = train_ds.filter(lambda ex: bool(ex["text"] and ex["text"].strip()))
     eval_ds = eval_ds.filter(lambda ex: bool(ex["text"] and ex["text"].strip()))
 
