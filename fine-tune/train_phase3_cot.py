@@ -239,14 +239,21 @@ def main():
         ddp_find_unused_parameters=False if world_size > 1 else None,
     )
 
-    trainer = SFTTrainer(
+    trainer_kwargs = dict(
         model=model,
         args=sft_args,
         train_dataset=train_ds,
         eval_dataset=eval_ds,
         processing_class=tokenizer,
+        dataset_text_field="text",
         callbacks=[Phase3SyncCallback()],
     )
+    try:
+        trainer = SFTTrainer(**trainer_kwargs)
+    except TypeError:
+        trainer_kwargs.pop("processing_class", None)
+        trainer_kwargs["tokenizer"] = tokenizer
+        trainer = SFTTrainer(**trainer_kwargs)
 
     trainer = train_on_responses_only(
         trainer,
