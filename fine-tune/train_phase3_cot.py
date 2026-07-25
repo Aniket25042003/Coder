@@ -55,7 +55,7 @@ def parse_args():
     p.add_argument("--batch", type=int, default=2, help="Per-device train batch size")
     p.add_argument("--accum", type=int, default=4, help="Gradient accumulation steps")
     p.add_argument("--lr", type=float, default=1.5e-5, help="Learning rate")
-    p.add_argument("--epochs", type=int, default=1, help="Number of train epochs")
+    p.add_argument("--epochs", type=int, default=2, help="Number of train epochs")
     p.add_argument("--max_seq_len", type=int, default=4096, help="Max sequence length")
     p.add_argument("--resume", type=str, default="auto", help="Resume mode: auto, none, or path")
     p.add_argument("--model_hub", type=str, default="Aniket200325/coder-qwen25-coder-7b-sft-qlora-v1-merged")
