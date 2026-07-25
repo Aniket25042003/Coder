@@ -1,3 +1,19 @@
+import sys
+import os
+from pathlib import Path
+
+# Add site-packages paths to sys.path to guarantee unsloth discovery across subprocesses
+for p in [
+    "/usr/local/lib/python3.12/dist-packages",
+    "/usr/local/lib/python3.10/dist-packages",
+    "/opt/conda/lib/python3.10/site-packages",
+    "/opt/conda/lib/python3.12/site-packages",
+    str(Path.home() / ".local/lib/python3.12/site-packages"),
+    str(Path.home() / ".local/lib/python3.10/site-packages"),
+]:
+    if Path(p).is_dir() and p not in sys.path:
+        sys.path.insert(0, p)
+
 #!/usr/bin/env python3
 """
 Phase 3 CoT Reasoning Fine-Tuning — Qwen2.5-Coder-7B SFT-merged
