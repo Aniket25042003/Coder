@@ -19,6 +19,8 @@ checkpoints/
 *.pt
 *.bin
 *.safetensors
+*.gguf
+Qwen-2.5-7B-Coder-Merged.Q4_K_M.gguf
 runs/
 tb/
 wandb/
@@ -26,6 +28,7 @@ scratch/
 data/
 final/
 *.parquet
+brain/
 
 # Jupyter / IDE
 .ipynb_checkpoints/
