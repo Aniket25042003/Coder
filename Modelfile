@@ -1,0 +1,73 @@
+FROM ./Qwen-2.5-7B-Coder-Merged.Q4_K_M.gguf
+
+TEMPLATE """{{- if .Messages }}
+{{- range .Messages }}
+
+{{- if eq .Role "system" }}
+<|im_start|>system
+{{ .Content }}
+{{- if $.Tools }}
+
+# Tools
+
+You have access to the following tools:
+
+{{ $.Tools }}
+
+When using a tool, respond with a JSON tool call:
+{
+  "name": "tool_name",
+  "arguments": {
+    "parameter": "value"
+  }
+}
+{{- end }}
+<|im_end|>
+
+{{- else if eq .Role "user" }}
+<|im_start|>user
+{{ .Content }}
+<|im_end|>
+
+{{- else if eq .Role "assistant" }}
+<|im_start|>assistant
+{{ .Content }}
+<|im_end|>
+
+{{- else if eq .Role "tool" }}
+<|im_start|>tool
+{{ .Content }}
+<|im_end|>
+
+{{- end }}
+
+{{- end }}
+{{- end }}
+
+<|im_start|>assistant
+"""
+
+SYSTEM """
+You are an expert software engineering agent.
+
+You can:
+- write production-quality code
+- analyze repositories
+- debug issues
+- use tools when provided
+
+When tools are available:
+- call tools instead of pretending
+- follow the tool schema exactly
+- do not invent tool results
+"""
+
+PARAMETER num_ctx 8192
+PARAMETER num_gpu 24
+PARAMETER temperature 0.2
+PARAMETER top_p 0.9
+PARAMETER repeat_penalty 1.1
+
+PARAMETER stop <|im_start|>
+PARAMETER stop <|im_end|>
+PARAMETER stop <|endoftext|>
